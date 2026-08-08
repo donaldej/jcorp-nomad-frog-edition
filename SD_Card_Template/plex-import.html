@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Plex Import</title>
+  <link rel="stylesheet" href="/master.css">
+  <script src="/theme-boot.js"></script>
+  <style>
+    :root {
+      --primary: #007bff;
+      --success: #28a745;
+      --warning: #ffc107;
+      --danger: #dc3545;
+      --secondary: #6c757d;
+      --bg: #f8f9fa;
+      --text: #212529;
+      --muted: #6c757d;
+      --card-bg: #ffffff;
+      --card-border: #dee2e6;
+      --header-text: #ffffff;
+      --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+      --shadow-large: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+    }
+    body.dark {
+      --bg: #121212;
+      --text: #e9ecef;
+      --muted: #adb5bd;
+      --card-bg: #1e1e1e;
+      --card-border: #343a40;
+      --header-text: #ffffff;
+      --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.3);
+      --shadow-large: 0 0.5rem 1rem rgba(0, 0, 0, 0.4);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .header {
+      background: var(--primary);
+      color: var(--header-text);
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-shadow: var(--shadow-large);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .header h1 { margin: 0; font-size: 1.5rem; }
+    .header-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .header a {
+      color: var(--header-text);
+      text-decoration: none;
+      background: rgba(255,255,255,0.2);
+      padding: 0.5rem 0.8rem;
+      border-radius: 0.375rem;
+      font-weight: 600;
+    }
+    .container {
+      width: min(1180px, calc(100% - 2rem));
+      margin: 1.5rem auto 3rem;
+      display: grid;
+      gap: 1rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 0.75rem;
+      padding: 1.25rem;
+      box-shadow: var(--shadow);
+    }
+    .card h2 {
+      margin: 0 0 1rem;
+      color: var(--primary);
+      font-size: 1.15rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1rem;
+    }
+    .form-group { display: grid; gap: 0.4rem; }
+    label { color: var(--muted); font-size: 0.875rem; font-weight: 600; }
+    input, select {
+      width: 100%;
+      padding: 0.7rem;
+      border: 1px solid var(--card-border);
+      border-radius: 0.375rem;
+      background: var(--card-bg);
+      color: var(--text);
+      font: inherit;
+    }
+    .btn {
+      border: 0;
+      border-radius: 0.375rem;
+      padding: 0.65rem 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      color: #fff;
+      background: var(--secondary);
+      min-height: 2.5rem;
+    }
+    .btn-primary { background: var(--primary); }
+    .btn-success { background: var(--success); }
+    .btn-danger { background: var(--danger); }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .toolbar {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .muted { color: var(--muted); font-size: 0.875rem; }
+    .list {
+      display: grid;
+      gap: 0.65rem;
+      max-height: 52vh;
+      overflow: auto;
+    }
+    .item {
+      border: 1px solid var(--card-border);
+      border-radius: 0.5rem;
+      padding: 0.85rem;
+      display: grid;
+      gap: 0.35rem;
+      cursor: pointer;
+    }
+    .item:hover { border-color: var(--primary); }
+    .item.selected { outline: 2px solid var(--primary); }
+    .item-title { font-weight: 800; overflow-wrap: anywhere; }
+    .item-sub { color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
+    .progress {
+      height: 0.7rem;
+      background: var(--card-border);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress > div {
+      width: 0%;
+      height: 100%;
+      background: var(--primary);
+      transition: width 0.2s;
+    }
+    .auth-panel { display: none; }
+    .auth-panel.visible { display: block; }
+    @media (max-width: 820px) {
+      .grid { grid-template-columns: 1fr; }
+      .header { align-items: flex-start; flex-direction: column; gap: 0.75rem; }
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>Plex Import</h1>
+    <div class="header-actions">
+      <a href="/menu">Menu</a>
+      <a href="/admin">Admin</a>
+      <a href="/uploads.html">Uploads</a>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="auth-panel" class="card auth-panel">
+      <h2>Admin Login</h2>
+      <div class="grid">
+        <div class="form-group">
+          <label for="admin-password">Admin Password</label>
+          <input id="admin-password" type="password" autocomplete="current-password">
+        </div>
+        <div class="form-group" style="align-self:end;">
+          <button id="auth-login" class="btn btn-primary">Login</button>
+        </div>
+      </div>
+      <div id="auth-message" class="muted" style="margin-top:0.75rem;"></div>
+    </section>
+
+    <section class="card">
+      <h2>Plex Connection</h2>
+      <div class="grid">
+        <div class="form-group">
+          <label for="plex-url">Plex Server URL</label>
+          <input id="plex-url" type="url" placeholder="http://192.168.18.21:32400">
+        </div>
+        <div class="form-group">
+          <label for="plex-token">Plex Token</label>
+          <input id="plex-token" type="password" autocomplete="off">
+        </div>
+      </div>
+      <div class="toolbar" style="margin-top:1rem;">
+        <button id="save-settings" class="btn btn-primary">Save Plex Settings</button>
+        <button id="load-libraries" class="btn btn-success">Load Libraries</button>
+      </div>
+      <div id="connection-message" class="muted" style="margin-top:0.75rem;"></div>
+    </section>
+
+    <section class="card">
+      <h2>Browse Plex</h2>
+      <div class="grid">
+        <div class="form-group">
+          <label for="library-select">Library</label>
+          <select id="library-select"></select>
+        </div>
+        <div class="form-group">
+          <label for="filter">Filter</label>
+          <input id="filter" type="search" placeholder="Type to filter loaded results">
+        </div>
+      </div>
+      <div class="toolbar" style="margin-top:1rem;">
+        <button id="load-items" class="btn btn-primary">Load Items</button>
+        <button id="load-episodes" class="btn">Load Episodes</button>
+      </div>
+      <div id="items" class="list" style="margin-top:1rem;"></div>
+    </section>
+
+    <section class="card">
+      <h2>Import Target</h2>
+      <div class="grid">
+        <div class="form-group">
+          <label for="dest-dir">Nomad Folder</label>
+          <input id="dest-dir" type="text" placeholder="/Movies/Movie Name (2024)">
+        </div>
+        <div class="form-group">
+          <label for="filename">Filename</label>
+          <input id="filename" type="text" placeholder="Movie Name (2024).mp4">
+        </div>
+      </div>
+      <div class="toolbar" style="margin-top:1rem;">
+        <button id="start-import" class="btn btn-success" disabled>Start Import</button>
+      </div>
+      <div id="selected-message" class="muted" style="margin-top:0.75rem;">No Plex item selected.</div>
+    </section>
+
+    <section class="card">
+      <h2>Import Progress</h2>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <div id="progress-message" class="muted" style="margin-top:0.75rem;">Idle</div>
+    </section>
+  </main>
+
+  <script>
+    const TOKEN_KEY = 'nomad_admin_token';
+    const els = {
+      authPanel: document.getElementById('auth-panel'),
+      adminPassword: document.getElementById('admin-password'),
+      authLogin: document.getElementById('auth-login'),
+      authMessage: document.getElementById('auth-message'),
+      plexUrl: document.getElementById('plex-url'),
+      plexToken: document.getElementById('plex-token'),
+      saveSettings: document.getElementById('save-settings'),
+      loadLibraries: document.getElementById('load-libraries'),
+      connectionMessage: document.getElementById('connection-message'),
+      librarySelect: document.getElementById('library-select'),
+      filter: document.getElementById('filter'),
+      loadItems: document.getElementById('load-items'),
+      loadEpisodes: document.getElementById('load-episodes'),
+      items: document.getElementById('items'),
+      destDir: document.getElementById('dest-dir'),
+      filename: document.getElementById('filename'),
+      startImport: document.getElementById('start-import'),
+      selectedMessage: document.getElementById('selected-message'),
+      progressBar: document.getElementById('progress-bar'),
+      progressMessage: document.getElementById('progress-message')
+    };
+
+    let libraries = [];
+    let items = [];
+    let selected = null;
+    let pollTimer = null;
+
+    function adminToken() {
+      try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
+    }
+
+    function setAdminToken(token) {
+      try { sessionStorage.setItem(TOKEN_KEY, token || ''); } catch (e) {}
+    }
+
+    function adminHeaders(extra) {
+      const headers = Object.assign({}, extra || {});
+      const token = adminToken();
+      if (token) headers['X-Admin-Token'] = token;
+      return headers;
+    }
+
+    async function sha256Hex(text) {
+      if (!window.crypto || !window.crypto.subtle) return text;
+      const data = new TextEncoder().encode(text);
+      const digest = await crypto.subtle.digest('SHA-256', data);
+      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function api(url, options) {
+      const res = await fetch(url, Object.assign({}, options || {}, {
+        headers: adminHeaders((options && options.headers) || {})
+      }));
+      if (res.status === 401) els.authPanel.classList.add('visible');
+      if (!res.ok) {
+        let text = await res.text();
+        try { text = JSON.parse(text).error || text; } catch (e) {}
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      return res.json();
+    }
+
+    function asArray(value) {
+      if (!value) return [];
+      return Array.isArray(value) ? value : [value];
+    }
+
+    function mediaContainer(data) {
+      return data && (data.MediaContainer || data.mediaContainer || data);
+    }
+
+    function cleanName(value) {
+      return String(value || 'Untitled')
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/[. ]+$/g, '') || 'Untitled';
+    }
+
+    function extFromPart(part) {
+      const file = part && part.file ? String(part.file) : '';
+      const m = file.match(/\.([a-z0-9]{2,5})$/i);
+      return m ? `.${m[1]}` : '.mp4';
+    }
+
+    function bestPart(video) {
+      const media = asArray(video.Media);
+      for (const m of media) {
+        const parts = asArray(m.Part);
+        for (const p of parts) {
+          if (p && p.key) return p;
+        }
+      }
+      return null;
+    }
+
+    function targetFor(video) {
+      const type = video.type;
+      const part = bestPart(video);
+      const ext = extFromPart(part);
+      if (type === 'episode') {
+        const show = cleanName(video.grandparentTitle);
+        const season = Number(video.parentIndex || 0);
+        const episode = Number(video.index || 0);
+        const title = cleanName(video.title);
+        return {
+          dir: `/Shows/${show}/Season ${String(season).padStart(2, '0')}`,
+          filename: `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')} - ${title}${ext}`,
+          reindexRoot: '/Shows'
+        };
+      }
+      const title = cleanName(video.title);
+      const year = video.year ? ` (${video.year})` : '';
+      return {
+        dir: `/Movies/${title}${year}`,
+        filename: `${title}${year}${ext}`,
+        reindexRoot: '/Movies'
+      };
+    }
+
+    function renderItems() {
+      const q = els.filter.value.trim().toLowerCase();
+      const visible = items.filter(item => {
+        const title = `${item.title || ''} ${item.grandparentTitle || ''}`.toLowerCase();
+        return !q || title.includes(q);
+      });
+      els.items.innerHTML = '';
+      for (const item of visible) {
+        const row = document.createElement('div');
+        row.className = 'item';
+        if (selected && selected.ratingKey === item.ratingKey) row.classList.add('selected');
+        const part = bestPart(item);
+        const title = item.type === 'episode'
+          ? `${item.grandparentTitle || 'Show'} - S${String(item.parentIndex || 0).padStart(2, '0')}E${String(item.index || 0).padStart(2, '0')} - ${item.title || 'Episode'}`
+          : `${item.title || 'Untitled'}${item.year ? ` (${item.year})` : ''}`;
+        row.innerHTML = `<div class="item-title"></div><div class="item-sub"></div>`;
+        row.querySelector('.item-title').textContent = title;
+        row.querySelector('.item-sub').textContent = part ? (part.file || part.key || '') : 'No downloadable Plex part found';
+        row.addEventListener('click', () => selectItem(item));
+        els.items.appendChild(row);
+      }
+      if (!visible.length) els.items.innerHTML = '<div class="muted">No items loaded.</div>';
+    }
+
+    function selectItem(item) {
+      selected = item;
+      const part = bestPart(item);
+      if (!part) {
+        els.startImport.disabled = true;
+        els.selectedMessage.textContent = 'Selected item has no downloadable Plex part.';
+        renderItems();
+        return;
+      }
+      const target = targetFor(item);
+      els.destDir.value = target.dir;
+      els.filename.value = target.filename;
+      els.startImport.disabled = false;
+      els.selectedMessage.textContent = `Selected: ${item.title || item.grandparentTitle || 'Plex item'}`;
+      renderItems();
+    }
+
+    async function loadSettings() {
+      try {
+        const settings = await api('/settings', { cache: 'no-store' });
+        if (settings.adminPasswordSet && !adminToken()) els.authPanel.classList.add('visible');
+        els.plexUrl.value = settings.plexUrl || '';
+        els.plexToken.value = settings.plexToken || '';
+      } catch (e) {
+        els.connectionMessage.textContent = e.message;
+      }
+    }
+
+    async function saveSettings() {
+      const body = {
+        plexUrl: els.plexUrl.value.trim(),
+        plexToken: els.plexToken.value.trim()
+      };
+      await api('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ body: JSON.stringify(body) })
+      });
+      els.connectionMessage.textContent = 'Plex settings saved.';
+    }
+
+    async function login() {
+      const password = els.adminPassword.value.trim();
+      if (!password) return;
+      const hash = await sha256Hex(password);
+      const res = await fetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ body: JSON.stringify({ hash }) })
+      });
+      if (!res.ok) {
+        els.authMessage.textContent = 'Login failed.';
+        return;
+      }
+      const data = await res.json();
+      setAdminToken(data.token);
+      els.authPanel.classList.remove('visible');
+      els.authMessage.textContent = '';
+      await loadSettings();
+    }
+
+    async function loadLibraries() {
+      els.connectionMessage.textContent = 'Loading Plex libraries...';
+      const data = await api('/api/plex/libraries', { cache: 'no-store' });
+      const mc = mediaContainer(data);
+      libraries = asArray(mc.Directory).filter(l => l.type === 'movie' || l.type === 'show');
+      els.librarySelect.innerHTML = '';
+      for (const lib of libraries) {
+        const opt = document.createElement('option');
+        opt.value = lib.key;
+        opt.textContent = `${lib.title} (${lib.type})`;
+        opt.dataset.type = lib.type;
+        els.librarySelect.appendChild(opt);
+      }
+      els.connectionMessage.textContent = libraries.length ? 'Libraries loaded.' : 'No movie/show libraries found.';
+    }
+
+    async function loadItems() {
+      const key = els.librarySelect.value;
+      if (!key) return;
+      els.items.innerHTML = '<div class="muted">Loading...</div>';
+      selected = null;
+      els.startImport.disabled = true;
+      const type = els.librarySelect.selectedOptions[0] && els.librarySelect.selectedOptions[0].dataset.type;
+      const data = await api(`/api/plex/library?key=${encodeURIComponent(key)}`, { cache: 'no-store' });
+      const mc = mediaContainer(data);
+      items = type === 'movie' ? asArray(mc.Metadata) : asArray(mc.Metadata || mc.Directory);
+      renderItems();
+    }
+
+    async function loadEpisodes() {
+      if (!selected || selected.type === 'episode') return;
+      const ratingKey = selected.ratingKey;
+      if (!ratingKey) return;
+      els.items.innerHTML = '<div class="muted">Loading episodes...</div>';
+      const data = await api(`/api/plex/episodes?ratingKey=${encodeURIComponent(ratingKey)}`, { cache: 'no-store' });
+      const mc = mediaContainer(data);
+      items = asArray(mc.Metadata);
+      selected = null;
+      els.startImport.disabled = true;
+      renderItems();
+    }
+
+    async function startImport() {
+      const part = selected && bestPart(selected);
+      if (!part) return;
+      const target = targetFor(selected);
+      const payload = {
+        partKey: part.key,
+        destDir: els.destDir.value.trim() || target.dir,
+        filename: els.filename.value.trim() || target.filename,
+        label: selected.title || selected.grandparentTitle || 'Plex item',
+        reindexRoot: target.reindexRoot
+      };
+      await api('/api/plex/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ body: JSON.stringify(payload) })
+      });
+      els.progressMessage.textContent = 'Import queued.';
+      startPolling();
+    }
+
+    async function pollStatus() {
+      try {
+        const status = await api('/api/plex/import-status', { cache: 'no-store' });
+        const total = Number(status.total || 0);
+        const downloaded = Number(status.downloaded || 0);
+        const percent = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : (status.active ? 5 : (status.success ? 100 : 0));
+        els.progressBar.style.width = `${percent}%`;
+        els.progressMessage.textContent = `${status.message || 'Idle'} - ${status.label || ''} ${downloaded && total ? `(${percent}%)` : ''}`;
+        if (!status.active && pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      } catch (e) {
+        els.progressMessage.textContent = e.message;
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollStatus, 1500);
+      pollStatus();
+    }
+
+    els.authLogin.addEventListener('click', login);
+    els.adminPassword.addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+    els.saveSettings.addEventListener('click', () => saveSettings().catch(e => { els.connectionMessage.textContent = e.message; }));
+    els.loadLibraries.addEventListener('click', () => loadLibraries().catch(e => { els.connectionMessage.textContent = e.message; }));
+    els.loadItems.addEventListener('click', () => loadItems().catch(e => { els.items.innerHTML = `<div class="muted">${e.message}</div>`; }));
+    els.loadEpisodes.addEventListener('click', () => loadEpisodes().catch(e => { els.items.innerHTML = `<div class="muted">${e.message}</div>`; }));
+    els.filter.addEventListener('input', renderItems);
+    els.startImport.addEventListener('click', () => startImport().catch(e => { els.progressMessage.textContent = e.message; }));
+
+    loadSettings();
+    startPolling();
+  </script>
+</body>
+</html>

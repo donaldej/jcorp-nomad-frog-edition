@@ -2,6 +2,7 @@
 //<!-- Version 4.2.2 -->
 #include <Arduino.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <esp_netif.h>
 #include <esp_heap_caps.h>
 #include <AsyncTCP.h>
@@ -358,6 +359,8 @@ struct AdminSettings {
   String homeWifiSSID = "";
   String homeWifiPassword = "";
   bool homeWifiEnabled = false;
+  String plexUrl = "";
+  String plexToken = "";
   int brightness = 100;            // percent 0-100 (Set_Backlight range); 230 was out-of-range and ignored
   bool autoGenerateMedia = true;   // check for new files on boot (default on)
   bool flipScreen = false;         // rotate LCD 180 deg (USB port upside down, e.g. car mounts)
@@ -366,6 +369,27 @@ struct AdminSettings {
 AdminSettings settings;
 unsigned long homeWifiConnectStartedMs = 0;
 String homeWifiLastMessage = "Home WiFi disabled";
+
+struct PlexImportState {
+  bool active = false;
+  bool success = false;
+  uint64_t downloaded = 0;
+  uint64_t total = 0;
+  String label = "";
+  String destPath = "";
+  String message = "Idle";
+};
+
+struct PlexImportJob {
+  String url;
+  String destDir;
+  String filename;
+  String label;
+  String reindexRoot;
+};
+
+PlexImportState plexImportState;
+SemaphoreHandle_t plexImportMutex = NULL;
 // Set by the /settings handler (async_tcp task); consumed by the task that owns
 // LVGL flushes. MADCTL must never be written mid-flush from another task.
 volatile bool lcdRotatePending = false;
@@ -1290,7 +1314,7 @@ bool loadSettings() {
     return false;
   }
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError error = deserializeJson(doc, file);
   file.close();
 
@@ -1309,6 +1333,8 @@ bool loadSettings() {
   settings.homeWifiSSID = doc["homeWifiSSID"] | "";
   settings.homeWifiPassword = doc["homeWifiPassword"] | "";
   settings.homeWifiEnabled = doc["homeWifiEnabled"] | false;
+  settings.plexUrl = doc["plexUrl"] | "";
+  settings.plexToken = doc["plexToken"] | "";
   settings.brightness = doc["brightness"] | 100;
   // brightness is 0-100 (Set_Backlight ignores >100). old builds defaulted to 230, clamp it
   settings.brightness = constrain(settings.brightness, 0, 100);
@@ -1326,7 +1352,7 @@ bool saveSettings() {
     return false;
   }
 
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   doc["rgbMode"] = settings.rgbMode;
   doc["rgbColor"] = settings.rgbColor;
   doc["adminPassword"] = settings.adminPassword;
@@ -1335,6 +1361,8 @@ bool saveSettings() {
   doc["homeWifiSSID"] = settings.homeWifiSSID;
   doc["homeWifiPassword"] = settings.homeWifiPassword;
   doc["homeWifiEnabled"] = settings.homeWifiEnabled;
+  doc["plexUrl"] = settings.plexUrl;
+  doc["plexToken"] = settings.plexToken;
   doc["brightness"] = settings.brightness;
   doc["autoGenerateMedia"] = settings.autoGenerateMedia;
   doc["flipScreen"] = settings.flipScreen;
@@ -3614,6 +3642,216 @@ void applyWiFiSettings() {
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
   startNomadMDNS();
 }
+
+String plexBaseUrl() {
+  String base = settings.plexUrl;
+  base.trim();
+  while (base.endsWith("/")) base.remove(base.length() - 1);
+  return base;
+}
+
+String plexUrlForPath(const String &path) {
+  String url = plexBaseUrl() + path;
+  url += (url.indexOf('?') >= 0) ? "&" : "?";
+  url += "X-Plex-Token=" + settings.plexToken;
+  return url;
+}
+
+bool plexConfigured() {
+  return plexBaseUrl().length() > 0 && settings.plexToken.length() > 0;
+}
+
+void setPlexImportState(bool active, bool success, uint64_t downloaded, uint64_t total,
+                        const String &label, const String &destPath, const String &message) {
+  bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
+  plexImportState.active = active;
+  plexImportState.success = success;
+  plexImportState.downloaded = downloaded;
+  plexImportState.total = total;
+  plexImportState.label = label;
+  plexImportState.destPath = destPath;
+  plexImportState.message = message;
+  if (locked) xSemaphoreGive(plexImportMutex);
+}
+
+bool ensureDirectoryRecursive(String dir, String &error) {
+  if (!validateUserPath(dir, false, error)) return false;
+  dir.trim();
+  if (!dir.startsWith("/")) dir = "/" + dir;
+  while (dir.endsWith("/") && dir.length() > 1) dir.remove(dir.length() - 1);
+
+  String current = "";
+  int start = 1;
+  while (start < dir.length()) {
+    int slash = dir.indexOf('/', start);
+    String part = slash >= 0 ? dir.substring(start, slash) : dir.substring(start);
+    current += "/" + part;
+    if (!SD_MMC.exists(current)) {
+      if (!SD_MMC.mkdir(current)) {
+        error = "Failed to create " + current;
+        return false;
+      }
+    }
+    if (slash < 0) break;
+    start = slash + 1;
+  }
+  return true;
+}
+
+void sendPlexProxy(AsyncWebServerRequest *request, const String &plexPath) {
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+  if (!plexConfigured()) {
+    request->send(400, "application/json", "{\"error\":\"Plex URL and token are required\"}");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    request->send(503, "application/json", "{\"error\":\"Home WiFi is not connected\"}");
+    return;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  String url = plexUrlForPath(plexPath);
+  http.setTimeout(12000);
+  if (!http.begin(client, url)) {
+    request->send(500, "application/json", "{\"error\":\"Failed to initialize Plex request\"}");
+    return;
+  }
+  http.addHeader("Accept", "application/json");
+  int code = http.GET();
+  String payload = (code > 0) ? http.getString() : "";
+  http.end();
+
+  if (code < 200 || code >= 300) {
+    request->send(502, "application/json",
+                  String("{\"error\":\"Plex request failed\",\"status\":") + String(code) + "}");
+    return;
+  }
+  request->send(200, "application/json", payload);
+}
+
+void plexImportTask(void *pvParameters) {
+  PlexImportJob *job = static_cast<PlexImportJob*>(pvParameters);
+  String pathError;
+  String destDir = job->destDir;
+  String destPath = destDir + "/" + job->filename;
+  String tempPath = destPath + ".part";
+
+  setPlexImportState(true, false, 0, 0, job->label, destPath, "Preparing");
+  webLogf("info", "[Plex] Import started: %s", job->label.c_str());
+
+  bool ok = false;
+  String message = "";
+  uint64_t downloaded = 0;
+  int total = 0;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    message = "Home WiFi is not connected";
+  } else if (!validateUserPath(destDir, false, pathError) || !validateUserPath(destPath, false, pathError)) {
+    message = pathError;
+  } else {
+    bool sdReady = (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10000)) == pdTRUE);
+    if (!sdReady) {
+      message = "SD card busy";
+    } else {
+      if (!ensureDirectoryRecursive(destDir, message)) {
+        if (sdMutex) xSemaphoreGive(sdMutex);
+      } else if (SD_MMC.exists(destPath)) {
+        message = "Destination already exists";
+        if (sdMutex) xSemaphoreGive(sdMutex);
+      } else {
+        if (SD_MMC.exists(tempPath)) SD_MMC.remove(tempPath);
+        File out = SD_MMC.open(tempPath, FILE_WRITE);
+        if (sdMutex) xSemaphoreGive(sdMutex);
+
+        if (!out) {
+          message = "Failed to open destination file";
+        } else {
+          WiFiClient client;
+          HTTPClient http;
+          http.setTimeout(15000);
+          if (!http.begin(client, job->url)) {
+            message = "Failed to open Plex URL";
+          } else {
+            int code = http.GET();
+            total = http.getSize();
+            uint64_t contentLength = total > 0 ? (uint64_t)total : 0;
+            setPlexImportState(true, false, 0, contentLength, job->label, destPath, "Downloading");
+
+            if (code < 200 || code >= 300) {
+              message = "Plex download failed: HTTP " + String(code);
+            } else {
+              uint8_t buffer[2048];
+              WiFiClient *stream = http.getStreamPtr();
+              while (http.connected() && (total > 0 || total == -1)) {
+                size_t available = stream->available();
+                if (available) {
+                  size_t toRead = min(available, sizeof(buffer));
+                  int readLen = stream->readBytes(buffer, toRead);
+                  if (readLen <= 0) break;
+
+                  bool writeReady = (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE);
+                  if (!writeReady) {
+                    message = "SD card busy during write";
+                    break;
+                  }
+                  size_t written = out.write(buffer, readLen);
+                  if (sdMutex) xSemaphoreGive(sdMutex);
+                  if (written != (size_t)readLen) {
+                    message = "SD write failed";
+                    break;
+                  }
+                  downloaded += readLen;
+                  if (total > 0) total -= readLen;
+                  setPlexImportState(true, false, downloaded, contentLength, job->label, destPath, "Downloading");
+                } else {
+                  delay(1);
+                }
+              }
+              if (message.length() == 0) ok = true;
+            }
+            http.end();
+          }
+
+          bool closeReady = (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE);
+          if (closeReady) {
+            out.flush();
+            out.close();
+            if (ok) {
+              if (SD_MMC.rename(tempPath, destPath)) {
+                message = "Complete";
+              } else {
+                ok = false;
+                message = "Failed to finalize file";
+                SD_MMC.remove(tempPath);
+              }
+            } else {
+              SD_MMC.remove(tempPath);
+            }
+            if (sdMutex) xSemaphoreGive(sdMutex);
+          } else {
+            ok = false;
+            message = "SD card busy during close";
+          }
+        }
+      }
+    }
+  }
+
+  if (ok) {
+    webLogf("success", "[Plex] Import complete: %s", destPath.c_str());
+    if (job->reindexRoot.length()) enqueueIndexUpdateForPath(job->reindexRoot);
+  } else {
+    webLogf("error", "[Plex] Import failed: %s", message.c_str());
+  }
+  setPlexImportState(false, ok, downloaded, downloaded, job->label, destPath, message);
+  delete job;
+  vTaskDelete(NULL);
+}
+
 // Return number of connected stations on the softAP
 int getConnectedUserCount() {
   // WiFi.softAPgetStationNum() returns uint8_t number of clients
@@ -4506,6 +4744,12 @@ Serial.println("SD Card initialized successfully!");
       } else {
         Serial.println("[MP] gameMutex created");
       }
+    }
+
+    if (!plexImportMutex) {
+      plexImportMutex = xSemaphoreCreateMutex();
+      Serial.println(plexImportMutex ? "[Plex] import mutex created"
+                                     : "[WARN] Plex import mutex creation failed");
     }
 
     Serial.println("Loading Settings...");
@@ -5407,6 +5651,8 @@ server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
   if (checkAdminAuth(request)) {
     doc["wifiPassword"] = settings.wifiPassword;
     doc["homeWifiPassword"] = settings.homeWifiPassword;
+    doc["plexUrl"] = settings.plexUrl;
+    doc["plexToken"] = settings.plexToken;
   }
   doc["brightness"] = settings.brightness;
   doc["autoGenerateMedia"] = settings.autoGenerateMedia;
@@ -5429,7 +5675,7 @@ server.on("/settings", HTTP_POST, [](AsyncWebServerRequest *request){
   }
 
   String body = request->getParam("body", true)->value();
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError error = deserializeJson(doc, body);
   if (error) {
     request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
@@ -5444,6 +5690,8 @@ server.on("/settings", HTTP_POST, [](AsyncWebServerRequest *request){
   }
   if (doc.containsKey("wifiSSID")) settings.wifiSSID = doc["wifiSSID"].as<String>();
   if (doc.containsKey("wifiPassword")) settings.wifiPassword = doc["wifiPassword"].as<String>();
+  if (doc.containsKey("plexUrl")) settings.plexUrl = doc["plexUrl"].as<String>();
+  if (doc.containsKey("plexToken")) settings.plexToken = doc["plexToken"].as<String>();
   bool homeWifiChanged = false;
   if (doc.containsKey("homeWifiSSID")) {
     settings.homeWifiSSID = doc["homeWifiSSID"].as<String>();
@@ -5477,6 +5725,135 @@ server.on("/settings", HTTP_POST, [](AsyncWebServerRequest *request){
       webLogf("error", "Failed to save settings");
       request->send(500, "application/json", "{\"error\":\"Failed to save settings\"}");
   }
+});
+
+server.on("/api/plex/libraries", HTTP_GET, [](AsyncWebServerRequest *request){
+  sendPlexProxy(request, "/library/sections");
+});
+
+server.on("/api/plex/library", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (!request->hasParam("key")) {
+    request->send(400, "application/json", "{\"error\":\"Missing key\"}");
+    return;
+  }
+  String key = request->getParam("key")->value();
+  for (size_t i = 0; i < key.length(); ++i) {
+    if (!isDigit(key[i])) {
+      request->send(400, "application/json", "{\"error\":\"Invalid key\"}");
+      return;
+    }
+  }
+  sendPlexProxy(request, "/library/sections/" + key + "/all");
+});
+
+server.on("/api/plex/episodes", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (!request->hasParam("ratingKey")) {
+    request->send(400, "application/json", "{\"error\":\"Missing ratingKey\"}");
+    return;
+  }
+  String ratingKey = request->getParam("ratingKey")->value();
+  for (size_t i = 0; i < ratingKey.length(); ++i) {
+    if (!isDigit(ratingKey[i])) {
+      request->send(400, "application/json", "{\"error\":\"Invalid ratingKey\"}");
+      return;
+    }
+  }
+  sendPlexProxy(request, "/library/metadata/" + ratingKey + "/allLeaves");
+});
+
+server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+  PlexImportState copy;
+  bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
+  copy = plexImportState;
+  if (locked) xSemaphoreGive(plexImportMutex);
+
+  StaticJsonDocument<512> doc;
+  doc["active"] = copy.active;
+  doc["success"] = copy.success;
+  doc["downloaded"] = copy.downloaded;
+  doc["total"] = copy.total;
+  doc["label"] = copy.label;
+  doc["destPath"] = copy.destPath;
+  doc["message"] = copy.message;
+  String json;
+  serializeJson(doc, json);
+  request->send(200, "application/json", json);
+});
+
+server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+  if (!plexConfigured()) {
+    request->send(400, "application/json", "{\"error\":\"Plex URL and token are required\"}");
+    return;
+  }
+  if (!request->hasParam("body", true)) {
+    request->send(400, "application/json", "{\"error\":\"Missing body\"}");
+    return;
+  }
+
+  bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
+  bool busy = plexImportState.active;
+  if (locked) xSemaphoreGive(plexImportMutex);
+  if (busy) {
+    request->send(409, "application/json", "{\"error\":\"Another Plex import is already running\"}");
+    return;
+  }
+
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, request->getParam("body", true)->value());
+  if (error) {
+    request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  String partKey = doc["partKey"] | "";
+  String destDir = doc["destDir"] | "";
+  String filename = doc["filename"] | "";
+  String label = doc["label"] | filename;
+  String reindexRoot = doc["reindexRoot"] | "";
+  String pathError;
+
+  if (!partKey.startsWith("/")) {
+    request->send(400, "application/json", "{\"error\":\"Invalid Plex part key\"}");
+    return;
+  }
+  if (!validateUploadFilename(filename, pathError)) {
+    request->send(400, "application/json", String("{\"error\":\"") + jsonEscape(pathError) + "\"}");
+    return;
+  }
+  String destPath = destDir + "/" + filename;
+  if (!validateUserPath(destDir, false, pathError) || !validateUserPath(destPath, false, pathError)) {
+    request->send(400, "application/json", String("{\"error\":\"") + jsonEscape(pathError) + "\"}");
+    return;
+  }
+  if (reindexRoot.length() && !validateUserPath(reindexRoot, false, pathError)) {
+    request->send(400, "application/json", String("{\"error\":\"") + jsonEscape(pathError) + "\"}");
+    return;
+  }
+
+  PlexImportJob *job = new PlexImportJob();
+  job->url = plexUrlForPath(partKey + "?download=1");
+  job->destDir = destDir;
+  job->filename = filename;
+  job->label = label;
+  job->reindexRoot = reindexRoot;
+
+  setPlexImportState(true, false, 0, 0, label, destPath, "Queued");
+  BaseType_t created = xTaskCreatePinnedToCore(plexImportTask, "PlexImport", 8192, job, 1, NULL, 0);
+  if (created != pdPASS) {
+    setPlexImportState(false, false, 0, 0, label, destPath, "Failed to start import task");
+    delete job;
+    request->send(500, "application/json", "{\"error\":\"Failed to start import task\"}");
+    return;
+  }
+  request->send(202, "application/json", "{\"status\":\"queued\"}");
 });
 
 // POST /auth/login - verify the SHA-256 password hash and issue a session token.

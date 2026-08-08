@@ -6,32 +6,8 @@
   <title>Media Uploads</title>
   <link rel="stylesheet" href="/master.css">
   <script src="/theme-boot.js"></script>
+  <script src="/theme-manager.js"></script>
   <style>
-    :root {
-      --primary: #007bff;
-      --success: #28a745;
-      --warning: #ffc107;
-      --danger: #dc3545;
-      --secondary: #6c757d;
-      --bg: #f8f9fa;
-      --text: #212529;
-      --muted: #6c757d;
-      --card-bg: #ffffff;
-      --card-border: #dee2e6;
-      --header-text: #ffffff;
-      --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
-      --shadow-large: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
-    }
-    body.dark {
-      --bg: #121212;
-      --text: #e9ecef;
-      --muted: #adb5bd;
-      --card-bg: #1e1e1e;
-      --card-border: #343a40;
-      --header-text: #ffffff;
-      --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.3);
-      --shadow-large: 0 0.5rem 1rem rgba(0, 0, 0, 0.4);
-    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -103,12 +79,12 @@
       font-weight: 700;
       cursor: pointer;
       color: #fff;
-      background: var(--secondary);
+      background: var(--secondary, #6c757d);
       min-height: 2.5rem;
     }
     .btn-primary { background: var(--primary); }
-    .btn-success { background: var(--success); }
-    .btn-danger { background: var(--danger); }
+    .btn-success { background: var(--success, #28a745); }
+    .btn-danger { background: var(--danger, #dc3545); }
     .btn:disabled { opacity: 0.55; cursor: not-allowed; }
     .dropzone {
       border: 2px dashed var(--card-border);
@@ -620,6 +596,7 @@
     });
     els.dropzone.addEventListener('drop', event => addFiles(event.dataTransfer.files));
 
+    if (window.ThemeManager) ThemeManager.init();
     loadStatus();
     render();
   </script>

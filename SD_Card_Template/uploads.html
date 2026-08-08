@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Media Uploads</title>
+  <link rel="stylesheet" href="/master.css">
+  <script src="/theme-boot.js"></script>
+  <style>
+    :root {
+      --primary: #007bff;
+      --success: #28a745;
+      --warning: #ffc107;
+      --danger: #dc3545;
+      --secondary: #6c757d;
+      --bg: #f8f9fa;
+      --text: #212529;
+      --muted: #6c757d;
+      --card-bg: #ffffff;
+      --card-border: #dee2e6;
+      --header-text: #ffffff;
+      --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+      --shadow-large: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+    }
+    body.dark {
+      --bg: #121212;
+      --text: #e9ecef;
+      --muted: #adb5bd;
+      --card-bg: #1e1e1e;
+      --card-border: #343a40;
+      --header-text: #ffffff;
+      --shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.3);
+      --shadow-large: 0 0.5rem 1rem rgba(0, 0, 0, 0.4);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .header {
+      background: var(--primary);
+      color: var(--header-text);
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-shadow: var(--shadow-large);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .header h1 { margin: 0; font-size: 1.5rem; }
+    .header-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .header a {
+      color: var(--header-text);
+      text-decoration: none;
+      background: rgba(255,255,255,0.2);
+      padding: 0.5rem 0.8rem;
+      border-radius: 0.375rem;
+      font-weight: 600;
+    }
+    .container {
+      width: min(1180px, calc(100% - 2rem));
+      margin: 1.5rem auto 3rem;
+      display: grid;
+      gap: 1rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 0.75rem;
+      padding: 1.25rem;
+      box-shadow: var(--shadow);
+    }
+    .card h2 {
+      margin: 0 0 1rem;
+      color: var(--primary);
+      font-size: 1.15rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1rem;
+    }
+    .form-group { display: grid; gap: 0.4rem; }
+    label { color: var(--muted); font-size: 0.875rem; font-weight: 600; }
+    input, select {
+      width: 100%;
+      padding: 0.7rem;
+      border: 1px solid var(--card-border);
+      border-radius: 0.375rem;
+      background: var(--card-bg);
+      color: var(--text);
+      font: inherit;
+    }
+    .btn {
+      border: 0;
+      border-radius: 0.375rem;
+      padding: 0.65rem 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      color: #fff;
+      background: var(--secondary);
+      min-height: 2.5rem;
+    }
+    .btn-primary { background: var(--primary); }
+    .btn-success { background: var(--success); }
+    .btn-danger { background: var(--danger); }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .dropzone {
+      border: 2px dashed var(--card-border);
+      border-radius: 0.75rem;
+      min-height: 180px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      padding: 1.5rem;
+      background: rgba(127,127,127,0.06);
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .dropzone.dragover {
+      border-color: var(--primary);
+      background: rgba(0,123,255,0.08);
+    }
+    .dropzone strong { display: block; font-size: 1.15rem; margin-bottom: 0.35rem; }
+    .muted { color: var(--muted); font-size: 0.875rem; }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.75rem;
+    }
+    .status {
+      border: 1px solid var(--card-border);
+      border-radius: 0.5rem;
+      padding: 0.8rem;
+      background: rgba(127,127,127,0.05);
+    }
+    .status .label {
+      text-transform: uppercase;
+      font-size: 0.7rem;
+      color: var(--muted);
+      font-weight: 800;
+    }
+    .status .value {
+      margin-top: 0.25rem;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+    .progress {
+      height: 0.6rem;
+      background: var(--card-border);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress > div {
+      height: 100%;
+      width: 0%;
+      background: var(--primary);
+      transition: width 0.15s;
+    }
+    .queue {
+      display: grid;
+      gap: 0.75rem;
+    }
+    .queue-item {
+      border: 1px solid var(--card-border);
+      border-radius: 0.5rem;
+      padding: 0.9rem;
+      display: grid;
+      gap: 0.55rem;
+    }
+    .queue-main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    .queue-name { font-weight: 800; overflow-wrap: anywhere; }
+    .queue-meta { color: var(--muted); font-size: 0.85rem; }
+    .badge {
+      font-size: 0.75rem;
+      font-weight: 800;
+      padding: 0.25rem 0.5rem;
+      border-radius: 999px;
+      background: var(--secondary);
+      color: #fff;
+      white-space: nowrap;
+    }
+    .badge.done { background: var(--success); }
+    .badge.error { background: var(--danger); }
+    .badge.active { background: var(--primary); }
+    .toolbar {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .auth-panel { display: none; }
+    .auth-panel.visible { display: block; }
+    @media (max-width: 820px) {
+      .grid, .status-grid { grid-template-columns: 1fr; }
+      .header { align-items: flex-start; flex-direction: column; gap: 0.75rem; }
+      .queue-main { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>Media Uploads</h1>
+    <div class="header-actions">
+      <a href="/menu">Menu</a>
+      <a href="/admin">Admin</a>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="auth-panel" class="card auth-panel">
+      <h2>Admin Login</h2>
+      <div class="grid">
+        <div class="form-group">
+          <label for="auth-password">Password</label>
+          <input type="password" id="auth-password" autocomplete="current-password">
+        </div>
+        <div class="form-group" style="align-self:end;">
+          <button id="auth-login" class="btn btn-primary">Login</button>
+        </div>
+      </div>
+      <div id="auth-message" class="muted" style="margin-top:0.75rem;"></div>
+    </section>
+
+    <section class="card">
+      <h2>Connection</h2>
+      <div class="status-grid">
+        <div class="status">
+          <div class="label">Hotspot</div>
+          <div class="value">http://nomad.local</div>
+        </div>
+        <div class="status">
+          <div class="label">AP IP</div>
+          <div class="value">192.168.4.1</div>
+        </div>
+        <div class="status">
+          <div class="label">Home IP</div>
+          <div id="home-ip" class="value">-</div>
+        </div>
+        <div class="status">
+          <div class="label">Free Space</div>
+          <div id="free-space" class="value">-</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Destination</h2>
+      <div class="grid">
+        <div class="form-group">
+          <label for="bucket">Library</label>
+          <select id="bucket">
+            <option value="/Movies">Movies</option>
+            <option value="/Shows">Shows</option>
+            <option value="/Music">Music</option>
+            <option value="/Books">Books</option>
+            <option value="/Comics">Comics</option>
+            <option value="/Gallery">Gallery</option>
+            <option value="/Files">Files</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="subfolder">Optional Subfolder</label>
+          <input id="subfolder" type="text" placeholder="Example: Movie Name or Show/Season 01">
+        </div>
+        <div class="form-group" style="align-self:end;">
+          <button id="pick-files" class="btn btn-primary">Choose Files</button>
+          <input id="file-input" type="file" multiple style="display:none;">
+        </div>
+      </div>
+      <div id="target-path" class="muted" style="margin-top:0.8rem;">Target: /Movies</div>
+    </section>
+
+    <section class="card">
+      <h2>Add Files</h2>
+      <div id="dropzone" class="dropzone">
+        <div>
+          <strong>Drop media files here</strong>
+          <div class="muted">Files upload one at a time so the SD card and indexer stay responsive.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Queue</h2>
+      <div class="toolbar">
+        <button id="start-upload" class="btn btn-success">Start Upload</button>
+        <button id="clear-complete" class="btn">Clear Complete</button>
+        <button id="retry-failed" class="btn">Retry Failed</button>
+      </div>
+      <div style="display:grid;gap:0.5rem;margin:1rem 0;">
+        <div class="progress"><div id="total-progress"></div></div>
+        <div id="summary" class="muted">No files queued.</div>
+      </div>
+      <div id="queue" class="queue"></div>
+    </section>
+  </main>
+
+  <script>
+    const uploadEndpoint = '/upload';
+    const reindexEndpoint = '/api/reindex';
+    const adminTokenKey = 'nomad_admin_token';
+    const queue = [];
+    let uploading = false;
+
+    const els = {
+      authPanel: document.getElementById('auth-panel'),
+      authPassword: document.getElementById('auth-password'),
+      authLogin: document.getElementById('auth-login'),
+      authMessage: document.getElementById('auth-message'),
+      bucket: document.getElementById('bucket'),
+      subfolder: document.getElementById('subfolder'),
+      targetPath: document.getElementById('target-path'),
+      pickFiles: document.getElementById('pick-files'),
+      fileInput: document.getElementById('file-input'),
+      dropzone: document.getElementById('dropzone'),
+      startUpload: document.getElementById('start-upload'),
+      clearComplete: document.getElementById('clear-complete'),
+      retryFailed: document.getElementById('retry-failed'),
+      queue: document.getElementById('queue'),
+      summary: document.getElementById('summary'),
+      totalProgress: document.getElementById('total-progress'),
+      homeIp: document.getElementById('home-ip'),
+      freeSpace: document.getElementById('free-space')
+    };
+
+    function adminToken() {
+      return sessionStorage.getItem(adminTokenKey) || '';
+    }
+
+    function adminHeaders() {
+      const token = adminToken();
+      return token ? { 'X-Admin-Token': token } : {};
+    }
+
+    async function sha256Hex(text) {
+      if (!window.crypto || !crypto.subtle) {
+        console.warn('SubtleCrypto unavailable; using raw password fallback.');
+        return text || '';
+      }
+      const data = new TextEncoder().encode(text);
+      const digest = await crypto.subtle.digest('SHA-256', data);
+      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function login() {
+      els.authMessage.textContent = '';
+      const password = els.authPassword.value;
+      if (!password) return;
+      const hash = await sha256Hex(password);
+      const body = new URLSearchParams({ body: JSON.stringify({ hash }) });
+      const res = await fetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body
+      });
+      if (!res.ok) {
+        els.authMessage.textContent = 'Login failed.';
+        return;
+      }
+      const data = await res.json();
+      sessionStorage.setItem(adminTokenKey, data.token || '');
+      els.authPassword.value = '';
+      els.authPanel.classList.remove('visible');
+      els.authMessage.textContent = '';
+    }
+
+    function normalizeSubfolder(value) {
+      return (value || '')
+        .replace(/\\/g, '/')
+        .split('/')
+        .map(part => part.trim())
+        .filter(Boolean)
+        .filter(part => part !== '.' && part !== '..')
+        .join('/');
+    }
+
+    function targetDir() {
+      const base = els.bucket.value;
+      const sub = normalizeSubfolder(els.subfolder.value);
+      return sub ? `${base}/${sub}` : base;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let value = bytes;
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit++;
+      }
+      return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+    }
+
+    function addFiles(files) {
+      const dir = targetDir();
+      [...files].forEach(file => {
+        queue.push({
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          file,
+          dir,
+          progress: 0,
+          uploaded: 0,
+          speed: 0,
+          status: 'queued',
+          error: ''
+        });
+      });
+      render();
+    }
+
+    function statusLabel(item) {
+      if (item.status === 'done') return 'Done';
+      if (item.status === 'error') return 'Failed';
+      if (item.status === 'uploading') return 'Uploading';
+      return 'Queued';
+    }
+
+    function render() {
+      els.targetPath.textContent = `Target: ${targetDir()}`;
+      els.queue.innerHTML = '';
+      queue.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'queue-item';
+
+        const main = document.createElement('div');
+        main.className = 'queue-main';
+
+        const left = document.createElement('div');
+        const name = document.createElement('div');
+        name.className = 'queue-name';
+        name.textContent = item.file.name;
+        const meta = document.createElement('div');
+        meta.className = 'queue-meta';
+        const speed = item.status === 'uploading' ? ` at ${formatBytes(item.speed)}/s` : '';
+        meta.textContent = `${formatBytes(item.file.size)} to ${item.dir}${speed}`;
+        if (item.error) meta.textContent += ` - ${item.error}`;
+        left.append(name, meta);
+
+        const badge = document.createElement('div');
+        badge.className = `badge ${item.status === 'done' ? 'done' : item.status === 'error' ? 'error' : item.status === 'uploading' ? 'active' : ''}`;
+        badge.textContent = statusLabel(item);
+
+        main.append(left, badge);
+
+        const progress = document.createElement('div');
+        progress.className = 'progress';
+        const bar = document.createElement('div');
+        bar.style.width = `${Math.round(item.progress)}%`;
+        progress.appendChild(bar);
+
+        row.append(main, progress);
+        els.queue.appendChild(row);
+      });
+
+      const totalBytes = queue.reduce((sum, item) => sum + item.file.size, 0);
+      const uploadedBytes = queue.reduce((sum, item) => sum + Math.min(item.uploaded, item.file.size), 0);
+      const done = queue.filter(item => item.status === 'done').length;
+      const failed = queue.filter(item => item.status === 'error').length;
+      const percent = totalBytes > 0 ? (uploadedBytes / totalBytes) * 100 : 0;
+      els.totalProgress.style.width = `${percent}%`;
+      els.summary.textContent = queue.length
+        ? `${done}/${queue.length} complete, ${failed} failed, ${formatBytes(uploadedBytes)} of ${formatBytes(totalBytes)}`
+        : 'No files queued.';
+      els.startUpload.disabled = uploading || queue.every(item => item.status === 'done');
+    }
+
+    function uploadOne(item) {
+      return new Promise((resolve) => {
+        item.status = 'uploading';
+        item.progress = 0;
+        item.uploaded = 0;
+        item.error = '';
+        render();
+
+        const formData = new FormData();
+        formData.append('dir', item.dir);
+        formData.append('dir_abs', item.dir);
+        formData.append('path', item.dir);
+        formData.append('destination', item.dir);
+        formData.append('overwrite', '1');
+        formData.append('file', item.file, item.file.name);
+
+        const xhr = new XMLHttpRequest();
+        const started = performance.now();
+        xhr.open('POST', uploadEndpoint, true);
+        const token = adminToken();
+        if (token) xhr.setRequestHeader('X-Admin-Token', token);
+        xhr.timeout = 60 * 60 * 1000;
+
+        xhr.upload.onprogress = (event) => {
+          if (!event.lengthComputable) return;
+          item.uploaded = event.loaded;
+          item.progress = (event.loaded / event.total) * 100;
+          const elapsed = Math.max(0.001, (performance.now() - started) / 1000);
+          item.speed = event.loaded / elapsed;
+          render();
+        };
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            item.status = 'done';
+            item.progress = 100;
+            item.uploaded = item.file.size;
+          } else {
+            item.status = 'error';
+            item.error = `HTTP ${xhr.status}: ${xhr.responseText || 'Upload failed'}`;
+            if (xhr.status === 401) els.authPanel.classList.add('visible');
+          }
+          render();
+          resolve();
+        };
+        xhr.onerror = () => {
+          item.status = 'error';
+          item.error = 'Network error';
+          render();
+          resolve();
+        };
+        xhr.ontimeout = () => {
+          item.status = 'error';
+          item.error = 'Upload timed out';
+          render();
+          resolve();
+        };
+        xhr.send(formData);
+      });
+    }
+
+    async function startUploads() {
+      if (uploading) return;
+      uploading = true;
+      render();
+      for (const item of queue) {
+        if (item.status === 'done') continue;
+        await uploadOne(item);
+      }
+      uploading = false;
+      render();
+      triggerReindexForTouchedDirs();
+    }
+
+    async function triggerReindexForTouchedDirs() {
+      const dirs = [...new Set(queue.filter(item => item.status === 'done').map(item => item.dir))];
+      for (const dir of dirs) {
+        try {
+          await fetch(`${reindexEndpoint}?path=${encodeURIComponent(dir)}`, {
+            method: 'POST',
+            headers: adminHeaders()
+          });
+        } catch (e) {}
+      }
+    }
+
+    async function loadStatus() {
+      try {
+        const settings = await fetch('/settings', { cache: 'no-store', headers: adminHeaders() }).then(r => r.json());
+        if (settings.adminPasswordSet && !adminToken()) {
+          els.authPanel.classList.add('visible');
+        }
+        els.homeIp.textContent = settings.homeWifiIP || '-';
+      } catch (e) {}
+      try {
+        const sd = await fetch('/sdinfo', { cache: 'no-store' }).then(r => r.json());
+        const free = Math.max(0, (sd.total || 0) - (sd.used || 0));
+        els.freeSpace.textContent = formatBytes(free);
+      } catch (e) {}
+    }
+
+    els.bucket.addEventListener('change', render);
+    els.subfolder.addEventListener('input', render);
+    els.pickFiles.addEventListener('click', () => els.fileInput.click());
+    els.fileInput.addEventListener('change', () => {
+      addFiles(els.fileInput.files);
+      els.fileInput.value = '';
+    });
+    els.startUpload.addEventListener('click', startUploads);
+    els.clearComplete.addEventListener('click', () => {
+      for (let i = queue.length - 1; i >= 0; i--) {
+        if (queue[i].status === 'done') queue.splice(i, 1);
+      }
+      render();
+    });
+    els.retryFailed.addEventListener('click', () => {
+      queue.forEach(item => {
+        if (item.status === 'error') {
+          item.status = 'queued';
+          item.progress = 0;
+          item.uploaded = 0;
+          item.error = '';
+        }
+      });
+      render();
+    });
+    els.authLogin.addEventListener('click', login);
+    els.authPassword.addEventListener('keydown', event => {
+      if (event.key === 'Enter') login();
+    });
+
+    ['dragenter', 'dragover'].forEach(eventName => {
+      els.dropzone.addEventListener(eventName, event => {
+        event.preventDefault();
+        els.dropzone.classList.add('dragover');
+      });
+    });
+    ['dragleave', 'drop'].forEach(eventName => {
+      els.dropzone.addEventListener(eventName, event => {
+        event.preventDefault();
+        els.dropzone.classList.remove('dragover');
+      });
+    });
+    els.dropzone.addEventListener('drop', event => addFiles(event.dataTransfer.files));
+
+    loadStatus();
+    render();
+  </script>
+</body>
+</html>

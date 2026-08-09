@@ -350,10 +350,10 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define PLEX_IMPORT_BUFFER_SIZE 16384
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #define HTTP_HEALTH_LOG_INTERVAL_MS 30000UL
-#define HTTP_SELF_PROBE_INTERVAL_MS 60000UL
-#define HTTP_SELF_PROBE_TIMEOUT_MS 1800UL
-#define HTTP_SELF_PROBE_FAILS_BEFORE_RESTART 3
-#define HTTP_SELF_PROBE_MIN_UPTIME_MS 120000UL
+#define HEALTH_LOW_HEAP_WARN_BYTES 25000UL
+#define HEALTH_LOW_HEAP_RESTART_BYTES 18000UL
+#define HEALTH_LOW_HEAP_RESTART_STREAK 10
+#define HEALTH_MIN_UPTIME_BEFORE_RESTART_MS 300000UL
 #ifndef NOMAD_AP_CHANNEL
 #define NOMAD_AP_CHANNEL 6
 #endif
@@ -429,14 +429,11 @@ volatile unsigned long httpDebugPingCount = 0;
 volatile unsigned long httpDebugStatusCount = 0;
 volatile unsigned long httpLastDebugPingMs = 0;
 volatile unsigned long httpLastDebugStatusMs = 0;
-volatile unsigned long httpSelfProbeOkMs = 0;
-volatile unsigned long httpSelfProbeLastMs = 0;
-volatile uint32_t httpSelfProbeOkCount = 0;
-volatile uint32_t httpSelfProbeFailCount = 0;
-volatile uint32_t httpSelfProbeConsecutiveFails = 0;
-volatile bool httpSelfProbeEverOk = false;
-volatile int httpSelfProbeLastResult = 0;
-volatile unsigned long httpSelfProbeLastDurationMs = 0;
+volatile uint32_t healthLowHeapWarnCount = 0;
+volatile uint32_t healthLowHeapRestartStreak = 0;
+volatile unsigned long healthLastLogMs = 0;
+volatile unsigned long healthLastLowHeapMs = 0;
+volatile size_t healthLastFreeHeap = 0;
 // Set by the /settings handler (async_tcp task); consumed by the task that owns
 // LVGL flushes. MADCTL must never be written mid-flush from another task.
 volatile bool lcdRotatePending = false;
@@ -3748,46 +3745,6 @@ bool plexImportActiveSnapshot() {
   return active;
 }
 
-bool runHttpSelfProbe(unsigned long &durationMs, int &resultCode) {
-  unsigned long startMs = millis();
-  durationMs = 0;
-  resultCode = 0;
-
-  WiFiClient client;
-  client.setTimeout(HTTP_SELF_PROBE_TIMEOUT_MS);
-  IPAddress target = WiFi.status() == WL_CONNECTED ? WiFi.localIP() : WiFi.softAPIP();
-  if (!client.connect(target, 80, HTTP_SELF_PROBE_TIMEOUT_MS)) {
-    durationMs = millis() - startMs;
-    resultCode = -1;
-    client.stop();
-    return false;
-  }
-
-  client.print("GET /api/debug/ping HTTP/1.0\r\nHost: nomad\r\nConnection: close\r\n\r\n");
-  unsigned long deadline = millis() + HTTP_SELF_PROBE_TIMEOUT_MS;
-  String statusLine;
-  while (millis() < deadline) {
-    while (client.available()) {
-      char c = (char)client.read();
-      if (c == '\n') {
-        statusLine.trim();
-        bool ok = statusLine.indexOf(" 204 ") >= 0 || statusLine.endsWith(" 204");
-        durationMs = millis() - startMs;
-        resultCode = ok ? 204 : -2;
-        client.stop();
-        return ok;
-      }
-      if (c != '\r' && statusLine.length() < 48) statusLine += c;
-    }
-    delay(5);
-  }
-
-  durationMs = millis() - startMs;
-  resultCode = -3;
-  client.stop();
-  return false;
-}
-
 bool ensureDirectoryRecursive(String dir, String &error) {
   if (!validateUserPath(dir, false, error)) return false;
   dir.trim();
@@ -6119,14 +6076,13 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   http["debugStatusCount"] = httpDebugStatusCount;
   http["lastDebugPingAgeMs"] = httpLastDebugPingMs > 0 ? nowMs - httpLastDebugPingMs : 0;
   http["lastDebugStatusAgeMs"] = httpLastDebugStatusMs > 0 ? nowMs - httpLastDebugStatusMs : 0;
-  http["selfProbeEverOk"] = httpSelfProbeEverOk;
-  http["selfProbeOkCount"] = httpSelfProbeOkCount;
-  http["selfProbeFailCount"] = httpSelfProbeFailCount;
-  http["selfProbeConsecutiveFails"] = httpSelfProbeConsecutiveFails;
-  http["selfProbeLastResult"] = httpSelfProbeLastResult;
-  http["selfProbeLastDurationMs"] = httpSelfProbeLastDurationMs;
-  http["selfProbeLastAgeMs"] = httpSelfProbeLastMs > 0 ? nowMs - httpSelfProbeLastMs : 0;
-  http["selfProbeLastOkAgeMs"] = httpSelfProbeOkMs > 0 ? nowMs - httpSelfProbeOkMs : 0;
+  http["healthLastLogAgeMs"] = healthLastLogMs > 0 ? nowMs - healthLastLogMs : 0;
+  http["lowHeapWarnCount"] = healthLowHeapWarnCount;
+  http["lowHeapRestartStreak"] = healthLowHeapRestartStreak;
+  http["lastLowHeapAgeMs"] = healthLastLowHeapMs > 0 ? nowMs - healthLastLowHeapMs : 0;
+  http["lastFreeHeap"] = healthLastFreeHeap;
+  http["lowHeapWarnBytes"] = HEALTH_LOW_HEAP_WARN_BYTES;
+  http["lowHeapRestartBytes"] = HEALTH_LOW_HEAP_RESTART_BYTES;
 
   JsonObject plex = doc.createNestedObject("plexImport");
   plex["active"] = importCopy.active;
@@ -7044,21 +7000,34 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
     t = xTaskCreatePinnedToCore(+[](void *param){
       (void)param;
       unsigned long lastLogMs = 0;
-      unsigned long lastProbeMs = 0;
       for (;;) {
         unsigned long nowMs = millis();
+        size_t freeHeap = ESP.getFreeHeap();
+        healthLastFreeHeap = freeHeap;
 
         if (nowMs - lastLogMs >= HTTP_HEALTH_LOG_INTERVAL_MS) {
           lastLogMs = nowMs;
+          healthLastLogMs = nowMs;
           bool sdMutexFreeForLog = true;
           if (sdMutex) {
             sdMutexFreeForLog = (xSemaphoreTake(sdMutex, 0) == pdTRUE);
             if (sdMutexFreeForLog) xSemaphoreGive(sdMutex);
           }
-          Serial.printf("[HEALTH] up=%lu heap=%u minHeap=%u psram=%u wifi=%d rssi=%d apClients=%u sdMutex=%s index=%d queue=%u streams=%d plex=%d selfProbe=%d/%u failStreak=%u lastProbeMs=%lu\n",
+          if (freeHeap < HEALTH_LOW_HEAP_WARN_BYTES) {
+            healthLowHeapWarnCount++;
+            healthLastLowHeapMs = nowMs;
+          }
+          if (freeHeap < HEALTH_LOW_HEAP_RESTART_BYTES) {
+            healthLowHeapRestartStreak++;
+          } else {
+            healthLowHeapRestartStreak = 0;
+          }
+
+          Serial.printf("[HEALTH] up=%lu heap=%u minHeap=%u largest=%u psram=%u wifi=%d rssi=%d apClients=%u sdMutex=%s index=%d queue=%u streams=%d plex=%d lowHeapWarns=%u lowHeapStreak=%u\n",
                         nowMs,
-                        (unsigned)ESP.getFreeHeap(),
+                        (unsigned)freeHeap,
                         (unsigned)ESP.getMinFreeHeap(),
+                        (unsigned)ESP.getMaxAllocHeap(),
                         (unsigned)ESP.getFreePsram(),
                         (int)WiFi.status(),
                         WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
@@ -7068,42 +7037,15 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
                         (unsigned)(indexQueue ? uxQueueMessagesWaiting(indexQueue) : 0),
                         activeStreams,
                         plexImportActiveSnapshot() ? 1 : 0,
-                        httpSelfProbeLastResult,
-                        (unsigned)httpSelfProbeOkCount,
-                        (unsigned)httpSelfProbeConsecutiveFails,
-                        httpSelfProbeLastDurationMs);
-        }
+                        (unsigned)healthLowHeapWarnCount,
+                        (unsigned)healthLowHeapRestartStreak);
 
-        if (nowMs > HTTP_SELF_PROBE_MIN_UPTIME_MS &&
-            nowMs - lastProbeMs >= HTTP_SELF_PROBE_INTERVAL_MS) {
-          lastProbeMs = nowMs;
-          unsigned long durationMs = 0;
-          int resultCode = 0;
-          bool ok = runHttpSelfProbe(durationMs, resultCode);
-          httpSelfProbeLastMs = millis();
-          httpSelfProbeLastDurationMs = durationMs;
-          httpSelfProbeLastResult = resultCode;
-
-          if (ok) {
-            httpSelfProbeEverOk = true;
-            httpSelfProbeOkMs = httpSelfProbeLastMs;
-            httpSelfProbeOkCount++;
-            httpSelfProbeConsecutiveFails = 0;
-          } else {
-            httpSelfProbeFailCount++;
-            if (httpSelfProbeEverOk) httpSelfProbeConsecutiveFails++;
-            Serial.printf("[HEALTH] HTTP self-probe failed result=%d duration=%lu streak=%u everOk=%d\n",
-                          resultCode, durationMs,
-                          (unsigned)httpSelfProbeConsecutiveFails,
-                          httpSelfProbeEverOk ? 1 : 0);
-          }
-
-          bool importActive = plexImportActiveSnapshot();
-          if (httpSelfProbeEverOk &&
-              httpSelfProbeConsecutiveFails >= HTTP_SELF_PROBE_FAILS_BEFORE_RESTART &&
-              !importActive) {
-            Serial.printf("[HEALTH] HTTP self-probe failed %u times after previous success; restarting device\n",
-                          (unsigned)httpSelfProbeConsecutiveFails);
+          if (nowMs > HEALTH_MIN_UPTIME_BEFORE_RESTART_MS &&
+              healthLowHeapRestartStreak >= HEALTH_LOW_HEAP_RESTART_STREAK &&
+              !plexImportActiveSnapshot()) {
+            Serial.printf("[HEALTH] free heap stayed below %u bytes for %u checks; restarting device\n",
+                          (unsigned)HEALTH_LOW_HEAP_RESTART_BYTES,
+                          (unsigned)healthLowHeapRestartStreak);
             delay(100);
             ESP.restart();
           }
@@ -7112,7 +7054,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
         vTaskDelay(pdMS_TO_TICKS(1000));
       }
       vTaskDelete(NULL);
-    }, "HttpHealth", 6 * 1024, NULL, 1, NULL, 0);
+    }, "HttpHealth", 3 * 1024, NULL, 1, NULL, 0);
     if (t == pdPASS) {
       webLog("[SYSTEM] HTTP health watchdog started", "success");
     } else {

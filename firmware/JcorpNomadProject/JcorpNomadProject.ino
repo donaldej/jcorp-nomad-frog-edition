@@ -28,6 +28,8 @@
 #include "usb_mode.h"
 #include "boot_mode.h" // library for firmware switching
 
+#define NOMAD_FIRMWARE_BUILD_ID __DATE__ " " __TIME__
+
 struct BreakdownStats {
   uint64_t bytes = 0;
   uint32_t files = 0;
@@ -353,6 +355,7 @@ String encodeIndexName(const String &path);
 struct AdminSettings {
   String rgbMode = "off";
   String rgbColor = "#ff0000";
+  String firmwareBuildId = "";
   String adminPassword = "";
   String wifiSSID = "Jcorp_Nomad";
   String wifiPassword = "password";
@@ -367,8 +370,31 @@ struct AdminSettings {
 };
 
 AdminSettings settings;
+bool firmwareBuildChanged = false;
 unsigned long homeWifiConnectStartedMs = 0;
 String homeWifiLastMessage = "Home WiFi disabled";
+
+String firmwareBuildColor() {
+  const char* value = NOMAD_FIRMWARE_BUILD_ID;
+  uint32_t hash = 2166136261UL;
+  while (*value) {
+    hash ^= static_cast<uint8_t>(*value++);
+    hash *= 16777619UL;
+  }
+
+  uint8_t r = (hash >> 16) & 0xFF;
+  uint8_t g = (hash >> 8) & 0xFF;
+  uint8_t b = hash & 0xFF;
+
+  // Keep the build color visible even if the hash lands near black.
+  if (r < 0x40) r += 0x40;
+  if (g < 0x40) g += 0x40;
+  if (b < 0x40) b += 0x40;
+
+  char color[8];
+  snprintf(color, sizeof(color), "#%02X%02X%02X", r, g, b);
+  return String(color);
+}
 
 struct PlexImportState {
   bool active = false;
@@ -1314,7 +1340,7 @@ bool loadSettings() {
     return false;
   }
 
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   DeserializationError error = deserializeJson(doc, file);
   file.close();
 
@@ -1327,6 +1353,7 @@ bool loadSettings() {
 
   settings.rgbMode = doc["rgbMode"] | "off";
   settings.rgbColor = doc["rgbColor"] | "#ff0000";
+  settings.firmwareBuildId = doc["firmwareBuildId"] | "";
   settings.adminPassword = doc["adminPassword"] | "";
   settings.wifiSSID = doc["wifiSSID"] | "Jcorp_Nomad";
   settings.wifiPassword = doc["wifiPassword"] | "password";
@@ -1340,6 +1367,16 @@ bool loadSettings() {
   settings.brightness = constrain(settings.brightness, 0, 100);
   settings.autoGenerateMedia = doc["autoGenerateMedia"] | true;   // default on if unset
   settings.flipScreen = doc["flipScreen"] | false;
+
+  firmwareBuildChanged = settings.firmwareBuildId != String(NOMAD_FIRMWARE_BUILD_ID);
+  if (firmwareBuildChanged) {
+    settings.firmwareBuildId = NOMAD_FIRMWARE_BUILD_ID;
+    settings.rgbMode = "solid";
+    settings.rgbColor = firmwareBuildColor();
+    Serial.printf("[Settings] New firmware build detected: %s, LED color %s\n",
+                  NOMAD_FIRMWARE_BUILD_ID,
+                  settings.rgbColor.c_str());
+  }
 
   return true;
 }
@@ -1355,6 +1392,7 @@ bool saveSettings() {
   StaticJsonDocument<1024> doc;
   doc["rgbMode"] = settings.rgbMode;
   doc["rgbColor"] = settings.rgbColor;
+  doc["firmwareBuildId"] = settings.firmwareBuildId;
   doc["adminPassword"] = settings.adminPassword;
   doc["wifiSSID"] = settings.wifiSSID;
   doc["wifiPassword"] = settings.wifiPassword;
@@ -4754,6 +4792,11 @@ Serial.println("SD Card initialized successfully!");
 
     Serial.println("Loading Settings...");
     loadSettings();
+    if (firmwareBuildChanged) {
+      saveSettings();
+      firmwareBuildChanged = false;
+      webLogf("info", "Firmware build changed: %s", NOMAD_FIRMWARE_BUILD_ID);
+    }
     settingsReady = true; // signal background tasks the settings are loaded
     Serial.printf("[SETTINGS] autoGenerateMedia = %s\n", settings.autoGenerateMedia ? "true" : "false");
     applyWiFiSettings();
@@ -5636,9 +5679,12 @@ server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
 
 
 server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1280> doc;
   doc["rgbMode"] = settings.rgbMode;
   doc["rgbColor"] = settings.rgbColor;
+  doc["firmwareBuildId"] = NOMAD_FIRMWARE_BUILD_ID;
+  doc["firmwareBuildColor"] = firmwareBuildColor();
+  doc["storedFirmwareBuildId"] = settings.firmwareBuildId;
   doc["adminPasswordSet"] = isAdminAuthRequired();
   doc["wifiSSID"] = settings.wifiSSID;
   doc["homeWifiSSID"] = settings.homeWifiSSID;
@@ -5891,10 +5937,12 @@ server.on("/auth/logout", HTTP_POST, [](AsyncWebServerRequest *request){
   server.on("/admin-status", HTTP_GET, [](AsyncWebServerRequest *request){
     if (!checkAdminAuth(request)) { request->send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
     // Build JSON
-    StaticJsonDocument<768> doc;
+    StaticJsonDocument<1024> doc;
     doc["ssid"]         = settings.wifiSSID;
     doc["wifiPassword"] = settings.wifiPassword;
     doc["users"]        = getConnectedUserCount();
+    doc["firmwareBuildId"] = NOMAD_FIRMWARE_BUILD_ID;
+    doc["firmwareBuildColor"] = firmwareBuildColor();
     doc["homeWifiSSID"] = settings.homeWifiSSID;
     doc["homeWifiEnabled"] = settings.homeWifiEnabled;
     doc["homeWifiConnected"] = WiFi.status() == WL_CONNECTED;

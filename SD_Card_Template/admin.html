@@ -3,6 +3,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="nomad-ui-build-id" content="ui-20260809-001">
   <link rel="stylesheet" href="/master.css">
   <script src="/theme-boot.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -133,6 +134,11 @@
     .info-badge .value {
       font-weight: 600;
       color: var(--text);
+    }
+
+    .info-badge .value.compact {
+      font-size: 0.78rem;
+      white-space: nowrap;
     }
 
     /* Buttons */
@@ -698,6 +704,14 @@
       <div class="info-badge">
         <span class="label">Users</span>
         <span id="bar-users" class="value">-</span>
+      </div>
+      <div class="info-badge">
+        <span class="label">Firmware</span>
+        <span id="bar-fw-build" class="value compact" aria-live="polite" title="Firmware build ID">-</span>
+      </div>
+      <div class="info-badge">
+        <span class="label">UI</span>
+        <span id="bar-ui-build" class="value compact" title="Admin UI build ID">ui-20260809-001</span>
       </div>
     </div>
   </div>

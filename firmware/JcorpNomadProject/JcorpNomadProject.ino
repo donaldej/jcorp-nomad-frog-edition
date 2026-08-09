@@ -349,6 +349,11 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define MAX_CLIENTS 8 // SoftAP max_connection; keep in sync with WiFi.softAP() calls below
 #define PLEX_IMPORT_BUFFER_SIZE 16384
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
+#define HTTP_HEALTH_LOG_INTERVAL_MS 30000UL
+#define HTTP_SELF_PROBE_INTERVAL_MS 60000UL
+#define HTTP_SELF_PROBE_TIMEOUT_MS 1800UL
+#define HTTP_SELF_PROBE_FAILS_BEFORE_RESTART 3
+#define HTTP_SELF_PROBE_MIN_UPTIME_MS 120000UL
 #ifndef NOMAD_AP_CHANNEL
 #define NOMAD_AP_CHANNEL 6
 #endif
@@ -420,6 +425,18 @@ struct PlexImportJob {
 
 PlexImportState plexImportState;
 SemaphoreHandle_t plexImportMutex = NULL;
+volatile unsigned long httpDebugPingCount = 0;
+volatile unsigned long httpDebugStatusCount = 0;
+volatile unsigned long httpLastDebugPingMs = 0;
+volatile unsigned long httpLastDebugStatusMs = 0;
+volatile unsigned long httpSelfProbeOkMs = 0;
+volatile unsigned long httpSelfProbeLastMs = 0;
+volatile uint32_t httpSelfProbeOkCount = 0;
+volatile uint32_t httpSelfProbeFailCount = 0;
+volatile uint32_t httpSelfProbeConsecutiveFails = 0;
+volatile bool httpSelfProbeEverOk = false;
+volatile int httpSelfProbeLastResult = 0;
+volatile unsigned long httpSelfProbeLastDurationMs = 0;
 // Set by the /settings handler (async_tcp task); consumed by the task that owns
 // LVGL flushes. MADCTL must never be written mid-flush from another task.
 volatile bool lcdRotatePending = false;
@@ -3723,6 +3740,54 @@ void setPlexImportState(bool active, bool success, uint64_t downloaded, uint64_t
   if (locked) xSemaphoreGive(plexImportMutex);
 }
 
+bool plexImportActiveSnapshot() {
+  bool active = false;
+  bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(50)) == pdTRUE);
+  active = plexImportState.active;
+  if (locked) xSemaphoreGive(plexImportMutex);
+  return active;
+}
+
+bool runHttpSelfProbe(unsigned long &durationMs, int &resultCode) {
+  unsigned long startMs = millis();
+  durationMs = 0;
+  resultCode = 0;
+
+  WiFiClient client;
+  client.setTimeout(HTTP_SELF_PROBE_TIMEOUT_MS);
+  IPAddress target = WiFi.status() == WL_CONNECTED ? WiFi.localIP() : WiFi.softAPIP();
+  if (!client.connect(target, 80, HTTP_SELF_PROBE_TIMEOUT_MS)) {
+    durationMs = millis() - startMs;
+    resultCode = -1;
+    client.stop();
+    return false;
+  }
+
+  client.print("GET /api/debug/ping HTTP/1.0\r\nHost: nomad\r\nConnection: close\r\n\r\n");
+  unsigned long deadline = millis() + HTTP_SELF_PROBE_TIMEOUT_MS;
+  String statusLine;
+  while (millis() < deadline) {
+    while (client.available()) {
+      char c = (char)client.read();
+      if (c == '\n') {
+        statusLine.trim();
+        bool ok = statusLine.indexOf(" 204 ") >= 0 || statusLine.endsWith(" 204");
+        durationMs = millis() - startMs;
+        resultCode = ok ? 204 : -2;
+        client.stop();
+        return ok;
+      }
+      if (c != '\r' && statusLine.length() < 48) statusLine += c;
+    }
+    delay(5);
+  }
+
+  durationMs = millis() - startMs;
+  resultCode = -3;
+  client.stop();
+  return false;
+}
+
 bool ensureDirectoryRecursive(String dir, String &error) {
   if (!validateUserPath(dir, false, error)) return false;
   dir.trim();
@@ -5949,7 +6014,15 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
   request->send(200, "application/json", json);
 });
 
+server.on("/api/debug/ping", HTTP_GET, [](AsyncWebServerRequest *request){
+  httpDebugPingCount++;
+  httpLastDebugPingMs = millis();
+  request->send(204);
+});
+
 server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
+  httpDebugStatusCount++;
+  httpLastDebugStatusMs = millis();
   if (!checkAdminAuth(request)) {
     request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
     return;
@@ -5995,7 +6068,7 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
       (float)importCopy.downloaded * 1000.0f / (float)(nowMs - importCopy.startedMs);
   }
 
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<3072> doc;
   doc["buildId"] = NOMAD_FIRMWARE_BUILD_ID;
   doc["buildColor"] = firmwareBuildColor();
   doc["uptimeMs"] = nowMs;
@@ -6040,6 +6113,20 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   tasks["activeStreams"] = streamCount;
   tasks["mediaStreamingActive"] = mediaStreamingActive;
   tasks["lastStreamIoAgeMs"] = lastStreamIoMs > 0 ? nowMs - lastStreamIoMs : 0;
+
+  JsonObject http = doc.createNestedObject("http");
+  http["debugPingCount"] = httpDebugPingCount;
+  http["debugStatusCount"] = httpDebugStatusCount;
+  http["lastDebugPingAgeMs"] = httpLastDebugPingMs > 0 ? nowMs - httpLastDebugPingMs : 0;
+  http["lastDebugStatusAgeMs"] = httpLastDebugStatusMs > 0 ? nowMs - httpLastDebugStatusMs : 0;
+  http["selfProbeEverOk"] = httpSelfProbeEverOk;
+  http["selfProbeOkCount"] = httpSelfProbeOkCount;
+  http["selfProbeFailCount"] = httpSelfProbeFailCount;
+  http["selfProbeConsecutiveFails"] = httpSelfProbeConsecutiveFails;
+  http["selfProbeLastResult"] = httpSelfProbeLastResult;
+  http["selfProbeLastDurationMs"] = httpSelfProbeLastDurationMs;
+  http["selfProbeLastAgeMs"] = httpSelfProbeLastMs > 0 ? nowMs - httpSelfProbeLastMs : 0;
+  http["selfProbeLastOkAgeMs"] = httpSelfProbeOkMs > 0 ? nowMs - httpSelfProbeOkMs : 0;
 
   JsonObject plex = doc.createNestedObject("plexImport");
   plex["active"] = importCopy.active;
@@ -6952,6 +7039,84 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
       webLog("[SYSTEM] Streaming task started", "success");
     } else {
       webLog("[SYSTEM] Failed to start streaming task", "error");
+    }
+
+    t = xTaskCreatePinnedToCore(+[](void *param){
+      (void)param;
+      unsigned long lastLogMs = 0;
+      unsigned long lastProbeMs = 0;
+      for (;;) {
+        unsigned long nowMs = millis();
+
+        if (nowMs - lastLogMs >= HTTP_HEALTH_LOG_INTERVAL_MS) {
+          lastLogMs = nowMs;
+          bool sdMutexFreeForLog = true;
+          if (sdMutex) {
+            sdMutexFreeForLog = (xSemaphoreTake(sdMutex, 0) == pdTRUE);
+            if (sdMutexFreeForLog) xSemaphoreGive(sdMutex);
+          }
+          Serial.printf("[HEALTH] up=%lu heap=%u minHeap=%u psram=%u wifi=%d rssi=%d apClients=%u sdMutex=%s index=%d queue=%u streams=%d plex=%d selfProbe=%d/%u failStreak=%u lastProbeMs=%lu\n",
+                        nowMs,
+                        (unsigned)ESP.getFreeHeap(),
+                        (unsigned)ESP.getMinFreeHeap(),
+                        (unsigned)ESP.getFreePsram(),
+                        (int)WiFi.status(),
+                        WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+                        (unsigned)WiFi.softAPgetStationNum(),
+                        sdMutexFreeForLog ? "free" : "held",
+                        (int)(indexingInProgress || indexingTasksActive || requestIndexing),
+                        (unsigned)(indexQueue ? uxQueueMessagesWaiting(indexQueue) : 0),
+                        activeStreams,
+                        plexImportActiveSnapshot() ? 1 : 0,
+                        httpSelfProbeLastResult,
+                        (unsigned)httpSelfProbeOkCount,
+                        (unsigned)httpSelfProbeConsecutiveFails,
+                        httpSelfProbeLastDurationMs);
+        }
+
+        if (nowMs > HTTP_SELF_PROBE_MIN_UPTIME_MS &&
+            nowMs - lastProbeMs >= HTTP_SELF_PROBE_INTERVAL_MS) {
+          lastProbeMs = nowMs;
+          unsigned long durationMs = 0;
+          int resultCode = 0;
+          bool ok = runHttpSelfProbe(durationMs, resultCode);
+          httpSelfProbeLastMs = millis();
+          httpSelfProbeLastDurationMs = durationMs;
+          httpSelfProbeLastResult = resultCode;
+
+          if (ok) {
+            httpSelfProbeEverOk = true;
+            httpSelfProbeOkMs = httpSelfProbeLastMs;
+            httpSelfProbeOkCount++;
+            httpSelfProbeConsecutiveFails = 0;
+          } else {
+            httpSelfProbeFailCount++;
+            if (httpSelfProbeEverOk) httpSelfProbeConsecutiveFails++;
+            Serial.printf("[HEALTH] HTTP self-probe failed result=%d duration=%lu streak=%u everOk=%d\n",
+                          resultCode, durationMs,
+                          (unsigned)httpSelfProbeConsecutiveFails,
+                          httpSelfProbeEverOk ? 1 : 0);
+          }
+
+          bool importActive = plexImportActiveSnapshot();
+          if (httpSelfProbeEverOk &&
+              httpSelfProbeConsecutiveFails >= HTTP_SELF_PROBE_FAILS_BEFORE_RESTART &&
+              !importActive) {
+            Serial.printf("[HEALTH] HTTP self-probe failed %u times after previous success; restarting device\n",
+                          (unsigned)httpSelfProbeConsecutiveFails);
+            delay(100);
+            ESP.restart();
+          }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+      vTaskDelete(NULL);
+    }, "HttpHealth", 6 * 1024, NULL, 1, NULL, 0);
+    if (t == pdPASS) {
+      webLog("[SYSTEM] HTTP health watchdog started", "success");
+    } else {
+      webLog("[SYSTEM] Failed to start HTTP health watchdog", "error");
     }
 
     // UI / background task: lower frequency, handles status updates, temp, SDBAR, client count

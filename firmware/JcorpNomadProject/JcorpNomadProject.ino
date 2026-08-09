@@ -347,7 +347,7 @@ static bool shouldSkipIndexingPath(const String &path) {
 #endif
 #define INDEXER_SLEEP_MS 300000 // 5 minutes between background scans
 #define MAX_CLIENTS 8 // SoftAP max_connection; keep in sync with WiFi.softAP() calls below
-#define PLEX_IMPORT_BUFFER_SIZE 8192
+#define PLEX_IMPORT_BUFFER_SIZE 16384
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #ifndef NOMAD_AP_CHANNEL
 #define NOMAD_AP_CHANNEL 6
@@ -3701,6 +3701,31 @@ bool plexConfigured() {
   return plexBaseUrl().length() > 0 && settings.plexToken.length() > 0;
 }
 
+bool suspendSoftAPForPlexImport() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  Serial.println("[Plex] Suspending SoftAP during import for STA throughput");
+  webLog("[Plex] Temporarily disabling hotspot for faster home WiFi import", "info");
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  delay(250);
+  return true;
+}
+
+void restoreSoftAPAfterPlexImport(bool suspended) {
+  if (!suspended) return;
+  Serial.println("[Plex] Restoring SoftAP after import");
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAP(settings.wifiSSID.c_str(), settings.wifiPassword.c_str(), NOMAD_AP_CHANNEL, 0, MAX_CLIENTS);
+  configureSoftAPPerformance();
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  startNomadMDNS();
+  webLog("[Plex] Hotspot restored after import", "info");
+}
+
 void setPlexImportState(bool active, bool success, uint64_t downloaded, uint64_t total,
                         const String &label, const String &destPath, const String &message) {
   bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
@@ -3787,6 +3812,7 @@ void plexImportTask(void *pvParameters) {
   String message = "";
   uint64_t downloaded = 0;
   uint64_t contentLength = 0;
+  bool softApSuspended = false;
 
   if (WiFi.status() != WL_CONNECTED) {
     message = "Home WiFi is not connected";
@@ -3810,6 +3836,7 @@ void plexImportTask(void *pvParameters) {
         if (!out) {
           message = "Failed to open destination file";
         } else {
+          softApSuspended = suspendSoftAPForPlexImport();
           WiFiClient client;
           HTTPClient http;
           http.setTimeout(15000);
@@ -3911,6 +3938,8 @@ void plexImportTask(void *pvParameters) {
       }
     }
   }
+
+  restoreSoftAPAfterPlexImport(softApSuspended);
 
   if (ok) {
     webLogf("success", "[Plex] Import complete: %s", destPath.c_str());

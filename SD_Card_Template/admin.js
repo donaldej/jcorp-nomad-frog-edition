@@ -394,12 +394,29 @@ async function adminFetch(url, opts = {}) {
 }
 
 // Settings management
+const NOMAD_ADMIN_UI_BUILD_ID =
+  document.querySelector('meta[name="nomad-ui-build-id"]')?.content || 'ui-unknown';
+
+function setBuildBadges(data = {}) {
+  const uiBuild = document.getElementById('bar-ui-build');
+  if (uiBuild) uiBuild.textContent = NOMAD_ADMIN_UI_BUILD_ID;
+
+  const fwBuild = document.getElementById('bar-fw-build');
+  if (fwBuild) {
+    fwBuild.textContent = data.firmwareBuildId || '-';
+    if (data.firmwareBuildColor) {
+      fwBuild.title = `Firmware build ID; assigned LED color ${data.firmwareBuildColor}`;
+    }
+  }
+}
+
 async function loadSettings() {
   console.log("loadSettings() fired");
   try {
     const res = await adminFetch('/settings', { cache: 'no-store' });
     const s = await res.json();
     console.log("settings from backend:", s);
+    setBuildBadges(s);
 
     // Update UI elements
     if (s.hasOwnProperty('adminPasswordSet')) {
@@ -981,6 +998,7 @@ async function fetchAdminBar() {
     document.getElementById('bar-wifi-pass').textContent = data.wifiPassword || '-';
     document.getElementById('bar-users').textContent =
       typeof data.users === 'number' ? `${data.users}` : '0';
+    setBuildBadges(data);
     updateHomeWiFiStatus(data);
 
   } catch (e) {

@@ -403,6 +403,8 @@ struct PlexImportState {
   bool success = false;
   uint64_t downloaded = 0;
   uint64_t total = 0;
+  unsigned long startedMs = 0;
+  unsigned long updatedMs = 0;
   String label = "";
   String destPath = "";
   String message = "Idle";
@@ -3704,10 +3706,17 @@ bool plexConfigured() {
 void setPlexImportState(bool active, bool success, uint64_t downloaded, uint64_t total,
                         const String &label, const String &destPath, const String &message) {
   bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
+  unsigned long nowMs = millis();
+  if (active && !plexImportState.active) {
+    plexImportState.startedMs = nowMs;
+  } else if (!active) {
+    plexImportState.startedMs = 0;
+  }
   plexImportState.active = active;
   plexImportState.success = success;
   plexImportState.downloaded = downloaded;
   plexImportState.total = total;
+  plexImportState.updatedMs = nowMs;
   plexImportState.label = label;
   plexImportState.destPath = destPath;
   plexImportState.message = message;
@@ -5930,9 +5939,123 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
   doc["success"] = copy.success;
   doc["downloaded"] = copy.downloaded;
   doc["total"] = copy.total;
+  doc["startedMs"] = copy.startedMs;
+  doc["updatedMs"] = copy.updatedMs;
   doc["label"] = copy.label;
   doc["destPath"] = copy.destPath;
   doc["message"] = copy.message;
+  String json;
+  serializeJson(doc, json);
+  request->send(200, "application/json", json);
+});
+
+server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+
+  unsigned long nowMs = millis();
+  PlexImportState importCopy;
+  bool importLocked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(50)) == pdTRUE);
+  importCopy = plexImportState;
+  if (importLocked) xSemaphoreGive(plexImportMutex);
+
+  bool sdMutexExists = sdMutex != NULL;
+  bool sdMutexAvailable = false;
+  unsigned long sdProbeStartMs = millis();
+  if (sdMutex) {
+    sdMutexAvailable = (xSemaphoreTake(sdMutex, 0) == pdTRUE);
+    if (sdMutexAvailable) xSemaphoreGive(sdMutex);
+  }
+  unsigned long sdProbeMs = millis() - sdProbeStartMs;
+
+  int queueDepth = indexQueue ? uxQueueMessagesWaiting(indexQueue) : 0;
+  int streamCount = activeStreams;
+  if (streamingFilesMutex && xSemaphoreTake(streamingFilesMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    streamCount = streamingFiles.size();
+    xSemaphoreGive(streamingFilesMutex);
+  }
+
+  String currentPath;
+  int bucketNum = 0;
+  int totalBuckets = 0;
+  int indexPercent = 0;
+  if (indexingPathMutex && xSemaphoreTake(indexingPathMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    currentPath = currentIndexingPath;
+    bucketNum = g_currentBucketNum;
+    totalBuckets = g_totalBucketsForProgress;
+    indexPercent = g_indexProgressPercent;
+    xSemaphoreGive(indexingPathMutex);
+  }
+
+  float importAverageBytesPerSec = 0.0f;
+  if (importCopy.active && importCopy.startedMs > 0 && nowMs > importCopy.startedMs) {
+    importAverageBytesPerSec =
+      (float)importCopy.downloaded * 1000.0f / (float)(nowMs - importCopy.startedMs);
+  }
+
+  StaticJsonDocument<2048> doc;
+  doc["buildId"] = NOMAD_FIRMWARE_BUILD_ID;
+  doc["buildColor"] = firmwareBuildColor();
+  doc["uptimeMs"] = nowMs;
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["minFreeHeap"] = ESP.getMinFreeHeap();
+  doc["maxAllocHeap"] = ESP.getMaxAllocHeap();
+  doc["freePsram"] = ESP.getFreePsram();
+  doc["minFreePsram"] = ESP.getMinFreePsram();
+  doc["maxAllocPsram"] = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  doc["cpuMhz"] = ESP.getCpuFreqMHz();
+
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["mode"] = (int)WiFi.getMode();
+  wifi["status"] = (int)WiFi.status();
+  wifi["staConnected"] = WiFi.status() == WL_CONNECTED;
+  wifi["staSsid"] = settings.homeWifiSSID;
+  wifi["staIp"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
+  wifi["staRssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  wifi["apSsid"] = settings.wifiSSID;
+  wifi["apIp"] = WiFi.softAPIP().toString();
+  wifi["apStations"] = WiFi.softAPgetStationNum();
+
+  JsonObject sd = doc.createNestedObject("sd");
+  sd["mutexExists"] = sdMutexExists;
+  sd["mutexAvailableNow"] = sdMutexAvailable;
+  sd["mutexProbeMs"] = sdProbeMs;
+  sd["cachedTotal"] = cachedTotalBytes;
+  sd["cachedUsed"] = cachedUsedBytes;
+  sd["statTrusted"] = g_sdStatTrusted;
+  sd["scanInProgress"] = sdScanInProgress;
+
+  JsonObject tasks = doc.createNestedObject("tasks");
+  tasks["indexingInProgress"] = indexingInProgress;
+  tasks["indexingTasksActive"] = indexingTasksActive;
+  tasks["requestIndexing"] = requestIndexing;
+  tasks["backgroundShutdown"] = shutdownBackgroundTasks;
+  tasks["indexQueueDepth"] = queueDepth;
+  tasks["currentIndexPath"] = currentPath;
+  tasks["currentBucketNum"] = bucketNum;
+  tasks["totalBuckets"] = totalBuckets;
+  tasks["indexProgressPercent"] = indexPercent;
+  tasks["activeStreams"] = streamCount;
+  tasks["mediaStreamingActive"] = mediaStreamingActive;
+  tasks["lastStreamIoAgeMs"] = lastStreamIoMs > 0 ? nowMs - lastStreamIoMs : 0;
+
+  JsonObject plex = doc.createNestedObject("plexImport");
+  plex["active"] = importCopy.active;
+  plex["success"] = importCopy.success;
+  plex["downloaded"] = importCopy.downloaded;
+  plex["total"] = importCopy.total;
+  plex["label"] = importCopy.label;
+  plex["destPath"] = importCopy.destPath;
+  plex["message"] = importCopy.message;
+  plex["startedMs"] = importCopy.startedMs;
+  plex["updatedMs"] = importCopy.updatedMs;
+  plex["activeMs"] = (importCopy.active && importCopy.startedMs > 0 && nowMs >= importCopy.startedMs)
+                       ? nowMs - importCopy.startedMs : 0;
+  plex["averageBytesPerSec"] = importAverageBytesPerSec;
+  plex["averageMiBPerSec"] = importAverageBytesPerSec / 1048576.0f;
+
   String json;
   serializeJson(doc, json);
   request->send(200, "application/json", json);

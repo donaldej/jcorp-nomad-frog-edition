@@ -153,6 +153,8 @@ There are a few community forks that target other ESP32 boards, but your mileage
 - Fat32Format or equivalent
 - **Optional:** [HandBrake 1.11.2 preset](tools/handbrake/) for small,
   browser-friendly 480p MP4 files
+- **Optional:** [Plex to Nomad helper](tools/plex-to-nomad.ps1) for copying
+  selected Movies and Shows from a Plex server to Nomad over Wi-Fi.
 - SquareLine Studio (optional, for UI editing)
 
 ---
@@ -168,6 +170,34 @@ There are a few community forks that target other ESP32 boards, but your mileage
 7. Click the gear icon → Library Index → **Full Scan Now**.
 8. Monitor Admin Console for progress; scan may take minutes.
 9. Return to Menu page and enjoy your media!
+
+---
+
+## Plex to Nomad Helper
+
+Windows users can run `tools/plex-to-nomad.ps1` to copy selected movies or TV
+episodes from a Plex server to Nomad without manually hunting for files.
+
+```powershell
+.\tools\plex-to-nomad.ps1
+```
+
+The helper:
+
+- Reads Plex movie/show libraries using the Plex API.
+- Lets you pick movies or episodes from a numbered console list.
+- Creates matching folders on Nomad.
+- Uploads through Nomad's `/upload` endpoint with `curl.exe` progress.
+- Requests a Nomad reindex after uploads finish.
+
+If the Plex server's original file paths are not accessible from this PC, run:
+
+```powershell
+.\tools\plex-to-nomad.ps1 -DownloadIfMissing
+```
+
+That mode downloads a temporary copy from Plex first, uploads it to Nomad, then
+removes the temporary file.
 
 ---
 

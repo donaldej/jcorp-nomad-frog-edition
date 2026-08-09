@@ -347,6 +347,8 @@ static bool shouldSkipIndexingPath(const String &path) {
 #endif
 #define INDEXER_SLEEP_MS 300000 // 5 minutes between background scans
 #define MAX_CLIENTS 8 // SoftAP max_connection; keep in sync with WiFi.softAP() calls below
+#define PLEX_IMPORT_BUFFER_SIZE 8192
+#define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #ifndef NOMAD_AP_CHANNEL
 #define NOMAD_AP_CHANNEL 6
 #endif
@@ -3829,12 +3831,21 @@ void plexImportTask(void *pvParameters) {
             if (code < 200 || code >= 300) {
               message = "Plex download failed: HTTP " + String(code);
             } else {
-              uint8_t buffer[2048];
+              size_t bufferSize = PLEX_IMPORT_BUFFER_SIZE;
+              uint8_t *buffer = (uint8_t*)malloc(bufferSize);
+              if (!buffer) {
+                bufferSize = 4096;
+                buffer = (uint8_t*)malloc(bufferSize);
+              }
+              if (!buffer) {
+                message = "Not enough memory for Plex buffer";
+              }
               WiFiClient *stream = http.getStreamPtr();
-              while (http.connected() && (contentLength == 0 || downloaded < contentLength)) {
+              unsigned long lastStatusMs = millis();
+              while (buffer && http.connected() && (contentLength == 0 || downloaded < contentLength)) {
                 size_t available = stream->available();
                 if (available) {
-                  size_t toRead = min(available, sizeof(buffer));
+                  size_t toRead = min(available, bufferSize);
                   if (contentLength > 0) {
                     uint64_t remaining = contentLength - downloaded;
                     if (remaining < toRead) toRead = (size_t)remaining;
@@ -3854,11 +3865,17 @@ void plexImportTask(void *pvParameters) {
                     break;
                   }
                   downloaded += readLen;
-                  setPlexImportState(true, false, downloaded, contentLength, job->label, destPath, "Downloading");
+                  unsigned long nowMs = millis();
+                  if (nowMs - lastStatusMs >= PLEX_IMPORT_STATUS_INTERVAL_MS ||
+                      (contentLength > 0 && downloaded >= contentLength)) {
+                    setPlexImportState(true, false, downloaded, contentLength, job->label, destPath, "Downloading");
+                    lastStatusMs = nowMs;
+                  }
                 } else {
                   delay(1);
                 }
               }
+              if (buffer) free(buffer);
               if (message.length() == 0) {
                 if (contentLength > 0 && downloaded < contentLength) {
                   message = "Download ended early";

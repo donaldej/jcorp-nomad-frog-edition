@@ -4622,8 +4622,14 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, 
   size_t size = file.size();
   if (size > 768 * 1024 || ESP.getFreeHeap() < size + 50000) {
     file.close();
+    AsyncWebServerResponse *response = request->beginResponse(SD_MMC, filePath, mime);
     if (sdMutex) xSemaphoreGive(sdMutex);
-    request->send(503, "text/plain", "Low memory serving page; retry after import finishes");
+    if (!response) {
+      request->send(503, "text/plain", "Low memory serving page; retry after import finishes");
+      return true;
+    }
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
     return true;
   }
 

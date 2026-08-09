@@ -521,7 +521,7 @@
     els.filter.addEventListener('input', renderItems);
     els.startImport.addEventListener('click', () => startImport().catch(e => { els.progressMessage.textContent = e.message; }));
 
-    if (window.ThemeManager) ThemeManager.init();
+    if (typeof ThemeManager !== 'undefined') ThemeManager.init();
     loadSettings();
     startPolling();
   </script>

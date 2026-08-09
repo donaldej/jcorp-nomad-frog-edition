@@ -3784,7 +3784,7 @@ void plexImportTask(void *pvParameters) {
   bool ok = false;
   String message = "";
   uint64_t downloaded = 0;
-  int total = 0;
+  uint64_t contentLength = 0;
 
   if (WiFi.status() != WL_CONNECTED) {
     message = "Home WiFi is not connected";
@@ -3811,12 +3811,19 @@ void plexImportTask(void *pvParameters) {
           WiFiClient client;
           HTTPClient http;
           http.setTimeout(15000);
+          const char* headers[] = { "Content-Length" };
+          http.collectHeaders(headers, 1);
           if (!http.begin(client, job->url)) {
             message = "Failed to open Plex URL";
           } else {
             int code = http.GET();
-            total = http.getSize();
-            uint64_t contentLength = total > 0 ? (uint64_t)total : 0;
+            String lengthHeader = http.header("Content-Length");
+            if (lengthHeader.length() > 0) {
+              contentLength = strtoull(lengthHeader.c_str(), NULL, 10);
+            } else {
+              int reportedSize = http.getSize();
+              contentLength = reportedSize > 0 ? (uint64_t)reportedSize : 0;
+            }
             setPlexImportState(true, false, 0, contentLength, job->label, destPath, "Downloading");
 
             if (code < 200 || code >= 300) {
@@ -3824,10 +3831,14 @@ void plexImportTask(void *pvParameters) {
             } else {
               uint8_t buffer[2048];
               WiFiClient *stream = http.getStreamPtr();
-              while (http.connected() && (total > 0 || total == -1)) {
+              while (http.connected() && (contentLength == 0 || downloaded < contentLength)) {
                 size_t available = stream->available();
                 if (available) {
                   size_t toRead = min(available, sizeof(buffer));
+                  if (contentLength > 0) {
+                    uint64_t remaining = contentLength - downloaded;
+                    if (remaining < toRead) toRead = (size_t)remaining;
+                  }
                   int readLen = stream->readBytes(buffer, toRead);
                   if (readLen <= 0) break;
 
@@ -3843,13 +3854,18 @@ void plexImportTask(void *pvParameters) {
                     break;
                   }
                   downloaded += readLen;
-                  if (total > 0) total -= readLen;
                   setPlexImportState(true, false, downloaded, contentLength, job->label, destPath, "Downloading");
                 } else {
                   delay(1);
                 }
               }
-              if (message.length() == 0) ok = true;
+              if (message.length() == 0) {
+                if (contentLength > 0 && downloaded < contentLength) {
+                  message = "Download ended early";
+                } else {
+                  ok = true;
+                }
+              }
             }
             http.end();
           }
@@ -4564,7 +4580,62 @@ String getMimeType(const String &path) {
   if (path.endsWith(".ico"))  return "image/x-icon";
   return "application/octet-stream"; // fallback safe binary
 }
+
+bool shouldBufferSdAsset(const String &path) {
+  String lower = path;
+  lower.toLowerCase();
+  return lower.endsWith(".html") || lower.endsWith(".css") ||
+         lower.endsWith(".js") || lower.endsWith(".mjs") ||
+         lower.endsWith(".json") || lower.endsWith(".svg");
+}
+
+bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, const String &mime) {
+  if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
+    request->send(503, "text/plain", "SD busy");
+    return true;
+  }
+
+  File file = SD_MMC.open(filePath, FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) file.close();
+    if (sdMutex) xSemaphoreGive(sdMutex);
+    return false;
+  }
+
+  size_t size = file.size();
+  if (size > 768 * 1024 || ESP.getFreeHeap() < size + 50000) {
+    file.close();
+    if (sdMutex) xSemaphoreGive(sdMutex);
+    request->send(503, "text/plain", "Low memory serving page; retry after import finishes");
+    return true;
+  }
+
+  String content;
+  content.reserve(size + 1);
+  char buffer[1024];
+  while (file.available()) {
+    size_t readLen = file.readBytes(buffer, sizeof(buffer));
+    if (!readLen) break;
+    content.concat(buffer, readLen);
+    yield();
+  }
+  file.close();
+  if (sdMutex) xSemaphoreGive(sdMutex);
+
+  AsyncWebServerResponse *response = request->beginResponse(200, mime, content);
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+  return true;
+}
+
 void serveProtectedFile(AsyncWebServerRequest *request, const String& filePath) {
+    String mime = getMimeType(filePath);
+    if (shouldBufferSdAsset(filePath)) {
+        if (sendBufferedSdFile(request, filePath, mime)) return;
+        request->send(404, "text/plain", "File not found");
+        return;
+    }
+
     if (sdMutex) {
         if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
             request->send(503, "text/plain", "SD busy");
@@ -4582,7 +4653,6 @@ void serveProtectedFile(AsyncWebServerRequest *request, const String& filePath) 
         return;
     }
     
-    String mime = getMimeType(filePath);
     AsyncWebServerResponse *response = request->beginResponse(SD_MMC, filePath, mime);
     releaseSd();
     if (!response) {
@@ -5257,12 +5327,16 @@ Serial.println("SD Card initialized successfully!");
     // Captive triggers for Apple & Android devices
     server.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *request) {
         Serial.println("Apple captive portal request detected, serving appleindex.html");
-        request->send(SD_MMC, "/appleindex.html", "text/html");
+        if (!sendBufferedSdFile(request, "/appleindex.html", "text/html")) {
+          request->send(404, "text/plain", "File not found");
+        }
     });
     
     server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *request) {
         Serial.println("Android/NORMAL captive portal request detected, serving index.html");
-        request->send(SD_MMC, "/index.html", "text/html");
+        if (!sendBufferedSdFile(request, "/index.html", "text/html")) {
+          request->send(404, "text/plain", "File not found");
+        }
     });
     server.on("/dlna/desc.xml", HTTP_GET, [](AsyncWebServerRequest *request){
       request->send(200, "text/xml", R"rawliteral(
@@ -5404,6 +5478,13 @@ Serial.println("SD Card initialized successfully!");
             
             // Serve the file
             String mime = getMimeType(filePath);
+            if (shouldBufferSdAsset(filePath)) {
+                releaseSd();
+                if (!sendBufferedSdFile(request, filePath, mime)) {
+                    request->send(404, "text/plain", "File not found");
+                }
+                return;
+            }
             AsyncWebServerResponse *response = request->beginResponse(SD_MMC, filePath, mime);
             releaseSd();
             
@@ -5416,12 +5497,16 @@ Serial.println("SD Card initialized successfully!");
     // Handle captive portal redirects for non-file requests
     if (userAgent.length()) {
         if (userAgent.indexOf("iPhone") >= 0 || userAgent.indexOf("iPad") >= 0 || userAgent.indexOf("Macintosh") >= 0) {
-            request->send(SD_MMC, "/appleindex.html", "text/html");
+            if (!sendBufferedSdFile(request, "/appleindex.html", "text/html")) {
+              request->send(404, "text/plain", "File not found");
+            }
             return;
         }
     }
     
-    request->send(SD_MMC, "/index.html", "text/html");
+    if (!sendBufferedSdFile(request, "/index.html", "text/html")) {
+      request->send(404, "text/plain", "File not found");
+    }
 });
     // /Gallery and /Files were serveStatic mounts - the only SD reads with no
     // sdMutex, no busy-503 and no OOM guard. Now handled in onNotFound instead.

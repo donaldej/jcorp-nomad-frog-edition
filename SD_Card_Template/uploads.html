@@ -596,7 +596,7 @@
     });
     els.dropzone.addEventListener('drop', event => addFiles(event.dataTransfer.files));
 
-    if (window.ThemeManager) ThemeManager.init();
+    if (typeof ThemeManager !== 'undefined') ThemeManager.init();
     loadStatus();
     render();
   </script>

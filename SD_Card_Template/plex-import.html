@@ -123,6 +123,44 @@
       background: var(--primary);
       transition: width 0.2s;
     }
+    .queue-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-top: 1.25rem;
+    }
+    .queue-list { display: grid; gap: 0.65rem; margin-top: 0.75rem; }
+    .queue-row {
+      border: 1px solid var(--card-border);
+      border-radius: 0.5rem;
+      padding: 0.75rem;
+      display: grid;
+      gap: 0.5rem;
+    }
+    .queue-row-main, .queue-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .queue-row-title { font-weight: 800; overflow-wrap: anywhere; }
+    .queue-row-meta { color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
+    .queue-actions { justify-content: flex-end; }
+    .queue-actions button { padding: 0.4rem 0.65rem; }
+    .badge {
+      border-radius: 999px;
+      color: #fff;
+      background: var(--secondary, #6c757d);
+      font-size: 0.75rem;
+      font-weight: 800;
+      padding: 0.25rem 0.55rem;
+      white-space: nowrap;
+    }
+    .badge.running, .badge.waiting { background: var(--primary); }
+    .badge.done { background: var(--success, #28a745); }
+    .badge.failed, .badge.cancelled { background: var(--danger, #dc3545); }
     .auth-panel { display: none; }
     .auth-panel.visible { display: block; }
     @media (max-width: 820px) {
@@ -216,6 +254,11 @@
       <h2>Import Progress</h2>
       <div class="progress"><div id="progress-bar"></div></div>
       <div id="progress-message" class="muted" style="margin-top:0.75rem;">Idle</div>
+      <div class="queue-header">
+        <strong>Device Queue</strong>
+        <button id="clear-history" class="btn btn-secondary">Clear Finished</button>
+      </div>
+      <div id="queue-list" class="queue-list"><div class="muted">No imports queued.</div></div>
     </section>
   </main>
 
@@ -241,7 +284,9 @@
       startImport: document.getElementById('start-import'),
       selectedMessage: document.getElementById('selected-message'),
       progressBar: document.getElementById('progress-bar'),
-      progressMessage: document.getElementById('progress-message')
+      progressMessage: document.getElementById('progress-message'),
+      clearHistory: document.getElementById('clear-history'),
+      queueList: document.getElementById('queue-list')
     };
 
     let libraries = [];
@@ -496,14 +541,60 @@
         const downloaded = Number(status.downloaded || 0);
         const percent = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : (status.active ? 5 : (status.success ? 100 : 0));
         els.progressBar.style.width = `${percent}%`;
-        els.progressMessage.textContent = `${status.message || 'Idle'} - ${status.label || ''} ${downloaded && total ? `(${percent}%)` : ''}`;
-        if (!status.active && pollTimer) {
-          clearInterval(pollTimer);
-          pollTimer = null;
-        }
+        const queued = Number(status.queued || 0);
+        els.progressMessage.textContent = `${status.message || 'Idle'} - ${status.label || ''} ${downloaded && total ? `(${percent}%)` : ''}${queued ? ` - ${queued} queued` : ''}`;
+        renderQueue(status.jobs || []);
       } catch (e) {
         els.progressMessage.textContent = e.message;
       }
+    }
+
+    function renderQueue(jobs) {
+      els.queueList.innerHTML = '';
+      if (!jobs.length) {
+        els.queueList.innerHTML = '<div class="muted">No imports queued.</div>';
+        return;
+      }
+      for (const job of jobs.slice().reverse()) {
+        const total = Number(job.total || 0);
+        const downloaded = Number(job.downloaded || 0);
+        const percent = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
+        const row = document.createElement('div');
+        row.className = 'queue-row';
+        row.innerHTML = `
+          <div class="queue-row-main">
+            <div class="queue-row-title"></div>
+            <span class="badge"></span>
+          </div>
+          <div class="queue-row-meta"></div>
+          <div class="progress"><div style="width:${percent}%"></div></div>
+          <div class="queue-actions"></div>`;
+        row.querySelector('.queue-row-title').textContent = job.label || job.destPath || `Import ${job.id}`;
+        const badge = row.querySelector('.badge');
+        badge.textContent = job.status || 'queued';
+        badge.classList.add(job.status || 'queued');
+        row.querySelector('.queue-row-meta').textContent = `${job.message || ''}${job.destPath ? ` - ${job.destPath}` : ''}${total ? ` - ${percent}%` : ''}`;
+        const actions = row.querySelector('.queue-actions');
+        if (['queued', 'waiting', 'running'].includes(job.status)) {
+          const cancel = document.createElement('button');
+          cancel.className = 'btn btn-danger';
+          cancel.textContent = 'Cancel';
+          cancel.addEventListener('click', () => queueAction('cancel', job.id));
+          actions.appendChild(cancel);
+        } else if (['failed', 'cancelled'].includes(job.status)) {
+          const retry = document.createElement('button');
+          retry.className = 'btn btn-success';
+          retry.textContent = 'Retry';
+          retry.addEventListener('click', () => queueAction('retry', job.id));
+          actions.appendChild(retry);
+        }
+        els.queueList.appendChild(row);
+      }
+    }
+
+    async function queueAction(action, id = 0) {
+      await api(`/api/plex/import-action?action=${encodeURIComponent(action)}&id=${encodeURIComponent(id)}`, { method: 'POST' });
+      await pollStatus();
     }
 
     function startPolling() {
@@ -520,6 +611,7 @@
     els.loadEpisodes.addEventListener('click', () => loadEpisodes().catch(e => { els.items.innerHTML = `<div class="muted">${e.message}</div>`; }));
     els.filter.addEventListener('input', renderItems);
     els.startImport.addEventListener('click', () => startImport().catch(e => { els.progressMessage.textContent = e.message; }));
+    els.clearHistory.addEventListener('click', () => queueAction('clear').catch(e => { els.progressMessage.textContent = e.message; }));
 
     if (typeof ThemeManager !== 'undefined') ThemeManager.init();
     loadSettings();

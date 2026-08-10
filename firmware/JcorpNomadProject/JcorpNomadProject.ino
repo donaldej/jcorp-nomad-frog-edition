@@ -11,6 +11,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <map>
+#include <vector>
 #include <time.h>
 #include "Display_ST7789.h"
 #include "LVGL_Driver.h"
@@ -349,6 +350,8 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define MAX_CLIENTS 8 // SoftAP max_connection; keep in sync with WiFi.softAP() calls below
 #define PLEX_IMPORT_BUFFER_SIZE 16384
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
+#define PLEX_QUEUE_PERSIST_INTERVAL_MS 5000UL
+#define PLEX_QUEUE_MAX_JOBS 16
 #define HTTP_HEALTH_LOG_INTERVAL_MS 30000UL
 #define HTTP_HEALTH_SAMPLE_INTERVAL_MS 5000UL
 #define HEALTH_LOW_HEAP_WARN_BYTES 25000UL
@@ -420,15 +423,36 @@ struct PlexImportState {
 };
 
 struct PlexImportJob {
-  String url;
+  uint32_t id = 0;
+  String partKey;
   String destDir;
   String filename;
   String label;
   String reindexRoot;
+  String destPath;
+  String status = "queued";
+  String message = "Queued";
+  uint64_t downloaded = 0;
+  uint64_t total = 0;
+  bool success = false;
+  volatile bool cancelRequested = false;
 };
 
 PlexImportState plexImportState;
+std::vector<PlexImportJob*> plexImportJobs;
+uint32_t plexImportNextId = 1;
+volatile bool plexImportWorkerRunning = false;
 SemaphoreHandle_t plexImportMutex = NULL;
+const char* PLEX_QUEUE_PATH = "/.system-index/plex_queue.ndjson";
+const char* PLEX_QUEUE_TEMP_PATH = "/.system-index/plex_queue.tmp";
+PlexImportJob* findPlexJobLocked(uint32_t id);
+uint32_t plexQueuedCountLocked();
+void updatePlexJob(PlexImportJob *job, const String &status, const String &message,
+                   uint64_t downloaded, uint64_t total, bool success);
+bool persistPlexImportQueue();
+void loadPlexImportQueue();
+bool startPlexImportWorkerIfNeeded();
+void plexImportTask(void *pvParameters);
 volatile unsigned long httpDebugPingCount = 0;
 volatile unsigned long httpDebugStatusCount = 0;
 volatile unsigned long httpLastDebugPingMs = 0;
@@ -3755,6 +3779,155 @@ bool plexImportActiveSnapshot() {
   return active;
 }
 
+PlexImportJob* findPlexJobLocked(uint32_t id) {
+  for (PlexImportJob *job : plexImportJobs) {
+    if (job && job->id == id) return job;
+  }
+  return nullptr;
+}
+
+uint32_t plexQueuedCountLocked() {
+  uint32_t count = 0;
+  for (PlexImportJob *job : plexImportJobs) {
+    if (job && job->status == "queued") count++;
+  }
+  return count;
+}
+
+void updatePlexJob(PlexImportJob *job, const String &status, const String &message,
+                   uint64_t downloaded, uint64_t total, bool success) {
+  if (!job) return;
+  bool locked = plexImportMutex &&
+                xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+  job->status = status;
+  job->message = message;
+  job->downloaded = downloaded;
+  job->total = total;
+  job->success = success;
+  unsigned long nowMs = millis();
+  if (status == "running" && !plexImportState.active) plexImportState.startedMs = nowMs;
+  plexImportState.active = status == "running";
+  plexImportState.success = success;
+  plexImportState.downloaded = downloaded;
+  plexImportState.total = total;
+  plexImportState.updatedMs = nowMs;
+  plexImportState.label = job->label;
+  plexImportState.destPath = job->destPath;
+  plexImportState.message = message;
+  if (locked) xSemaphoreGive(plexImportMutex);
+}
+
+bool persistPlexImportQueue() {
+  bool queueLocked = plexImportMutex &&
+                     xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(500)) == pdTRUE;
+  if (plexImportMutex && !queueLocked) return false;
+  bool sdLocked = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;
+  if (!sdLocked) {
+    if (queueLocked) xSemaphoreGive(plexImportMutex);
+    return false;
+  }
+
+  if (!SD_MMC.exists(INDEX_DIR)) SD_MMC.mkdir(INDEX_DIR);
+  if (SD_MMC.exists(PLEX_QUEUE_TEMP_PATH)) SD_MMC.remove(PLEX_QUEUE_TEMP_PATH);
+  File out = SD_MMC.open(PLEX_QUEUE_TEMP_PATH, FILE_WRITE);
+  bool ok = (bool)out;
+  if (ok) {
+    for (PlexImportJob *job : plexImportJobs) {
+      if (!job) continue;
+      StaticJsonDocument<1536> doc;
+      doc["id"] = job->id;
+      doc["partKey"] = job->partKey;
+      doc["destDir"] = job->destDir;
+      doc["filename"] = job->filename;
+      doc["label"] = job->label;
+      doc["reindexRoot"] = job->reindexRoot;
+      doc["destPath"] = job->destPath;
+      doc["status"] = job->status;
+      doc["message"] = job->message;
+      doc["downloaded"] = job->downloaded;
+      doc["total"] = job->total;
+      doc["success"] = job->success;
+      if (serializeJson(doc, out) == 0 || out.print('\n') == 0) {
+        ok = false;
+        break;
+      }
+    }
+    out.flush();
+    out.close();
+  }
+  if (ok) {
+    if (SD_MMC.exists(PLEX_QUEUE_PATH)) SD_MMC.remove(PLEX_QUEUE_PATH);
+    ok = SD_MMC.rename(PLEX_QUEUE_TEMP_PATH, PLEX_QUEUE_PATH);
+  }
+  if (!ok && SD_MMC.exists(PLEX_QUEUE_TEMP_PATH)) SD_MMC.remove(PLEX_QUEUE_TEMP_PATH);
+  if (sdMutex) xSemaphoreGive(sdMutex);
+  if (queueLocked) xSemaphoreGive(plexImportMutex);
+  return ok;
+}
+
+void loadPlexImportQueue() {
+  bool sdLocked = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;
+  if (!sdLocked || !SD_MMC.exists(PLEX_QUEUE_PATH)) {
+    if (sdLocked && sdMutex) xSemaphoreGive(sdMutex);
+    return;
+  }
+  File in = SD_MMC.open(PLEX_QUEUE_PATH, FILE_READ);
+  if (!in) {
+    if (sdMutex) xSemaphoreGive(sdMutex);
+    return;
+  }
+  while (in.available() && plexImportJobs.size() < PLEX_QUEUE_MAX_JOBS) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    StaticJsonDocument<1536> doc;
+    if (deserializeJson(doc, line)) continue;
+    PlexImportJob *job = new PlexImportJob();
+    if (!job) break;
+    job->id = doc["id"] | plexImportNextId;
+    job->partKey = doc["partKey"] | "";
+    job->destDir = doc["destDir"] | "";
+    job->filename = doc["filename"] | "";
+    job->label = doc["label"] | job->filename;
+    job->reindexRoot = doc["reindexRoot"] | "";
+    String defaultDestPath = job->destDir + "/" + job->filename;
+    job->destPath = doc["destPath"] | defaultDestPath;
+    job->status = doc["status"] | "queued";
+    job->message = doc["message"] | "Queued";
+    job->downloaded = doc["downloaded"] | 0ULL;
+    job->total = doc["total"] | 0ULL;
+    job->success = doc["success"] | false;
+    job->cancelRequested = false;
+    if (job->status == "running" || job->status == "waiting") {
+      job->status = "queued";
+      job->message = "Resuming after restart";
+    }
+    plexImportNextId = max(plexImportNextId, job->id + 1);
+    plexImportJobs.push_back(job);
+  }
+  in.close();
+  if (sdMutex) xSemaphoreGive(sdMutex);
+  webLogf("info", "[Plex] Restored %u queued/history jobs", (unsigned)plexImportJobs.size());
+}
+
+bool startPlexImportWorkerIfNeeded() {
+  bool locked = plexImportMutex &&
+                xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+  bool hasQueued = plexQueuedCountLocked() > 0;
+  if (!hasQueued || plexImportWorkerRunning) {
+    if (locked) xSemaphoreGive(plexImportMutex);
+    return true;
+  }
+  plexImportWorkerRunning = true;
+  if (locked) xSemaphoreGive(plexImportMutex);
+  BaseType_t created = xTaskCreatePinnedToCore(plexImportTask, "PlexImport", 10240, NULL, 1, NULL, 0);
+  if (created != pdPASS) {
+    plexImportWorkerRunning = false;
+    return false;
+  }
+  return true;
+}
+
 bool ensureDirectoryRecursive(String dir, String &error) {
   if (!validateUserPath(dir, false, error)) return false;
   dir.trim();
@@ -3815,153 +3988,214 @@ void sendPlexProxy(AsyncWebServerRequest *request, const String &plexPath) {
 }
 
 void plexImportTask(void *pvParameters) {
-  PlexImportJob *job = static_cast<PlexImportJob*>(pvParameters);
-  String pathError;
-  String destDir = job->destDir;
-  String destPath = destDir + "/" + job->filename;
-  String tempPath = destPath + ".part";
+  (void)pvParameters;
+  for (;;) {
+    PlexImportJob *job = nullptr;
+    bool locked = plexImportMutex &&
+                  xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+    for (PlexImportJob *candidate : plexImportJobs) {
+      if (candidate && candidate->status == "queued") {
+        job = candidate;
+        break;
+      }
+    }
+    if (locked) xSemaphoreGive(plexImportMutex);
 
-  setPlexImportState(true, false, 0, 0, job->label, destPath, "Preparing");
-  webLogf("info", "[Plex] Import started: %s", job->label.c_str());
+    if (!job) {
+      plexImportWorkerRunning = false;
+      plexImportState.active = false;
+      vTaskDelete(NULL);
+      return;
+    }
 
-  bool ok = false;
-  String message = "";
-  uint64_t downloaded = 0;
-  uint64_t contentLength = 0;
+    while (WiFi.status() != WL_CONNECTED && !job->cancelRequested) {
+      updatePlexJob(job, "waiting", "Waiting for home WiFi", job->downloaded, job->total, false);
+      delay(3000);
+    }
+    if (job->cancelRequested) {
+      updatePlexJob(job, "cancelled", "Cancelled", job->downloaded, job->total, false);
+      persistPlexImportQueue();
+      continue;
+    }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    message = "Home WiFi is not connected";
-  } else if (!validateUserPath(destDir, false, pathError) || !validateUserPath(destPath, false, pathError)) {
-    message = pathError;
-  } else {
-    bool sdReady = (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10000)) == pdTRUE);
-    if (!sdReady) {
-      message = "SD card busy";
+    String pathError;
+    String tempPath = job->destPath + ".part";
+    String message;
+    bool ok = false;
+    bool cancelled = false;
+    uint64_t downloaded = 0;
+    uint64_t total = 0;
+    updatePlexJob(job, "running", "Preparing", 0, 0, false);
+    webLogf("info", "[Plex] Import started: %s", job->label.c_str());
+
+    if (!validateUserPath(job->destDir, false, pathError) ||
+        !validateUserPath(job->destPath, false, pathError)) {
+      message = pathError;
     } else {
-      if (!ensureDirectoryRecursive(destDir, message)) {
+      bool sdReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10000)) == pdTRUE;
+      if (!sdReady) {
+        message = "SD card busy";
+      } else if (!ensureDirectoryRecursive(job->destDir, message)) {
         if (sdMutex) xSemaphoreGive(sdMutex);
-      } else if (SD_MMC.exists(destPath)) {
+      } else if (SD_MMC.exists(job->destPath)) {
         message = "Destination already exists";
         if (sdMutex) xSemaphoreGive(sdMutex);
       } else {
-        if (SD_MMC.exists(tempPath)) SD_MMC.remove(tempPath);
-        File out = SD_MMC.open(tempPath, FILE_WRITE);
         if (sdMutex) xSemaphoreGive(sdMutex);
-
-        if (!out) {
-          message = "Failed to open destination file";
-        } else {
-          WiFiClient client;
-          HTTPClient http;
-          http.setTimeout(15000);
-          const char* headers[] = { "Content-Length" };
-          http.collectHeaders(headers, 1);
-          if (!http.begin(client, job->url)) {
-            message = "Failed to open Plex URL";
-          } else {
-            int code = http.GET();
-            String lengthHeader = http.header("Content-Length");
-            if (lengthHeader.length() > 0) {
-              contentLength = strtoull(lengthHeader.c_str(), NULL, 10);
-            } else {
-              int reportedSize = http.getSize();
-              contentLength = reportedSize > 0 ? (uint64_t)reportedSize : 0;
-            }
-            setPlexImportState(true, false, 0, contentLength, job->label, destPath, "Downloading");
-
-            if (code < 200 || code >= 300) {
-              message = "Plex download failed: HTTP " + String(code);
-            } else {
-              size_t bufferSize = PLEX_IMPORT_BUFFER_SIZE;
-              uint8_t *buffer = (uint8_t*)malloc(bufferSize);
-              if (!buffer) {
-                bufferSize = 4096;
-                buffer = (uint8_t*)malloc(bufferSize);
-              }
-              if (!buffer) {
-                message = "Not enough memory for Plex buffer";
-              }
-              WiFiClient *stream = http.getStreamPtr();
-              unsigned long lastStatusMs = millis();
-              while (buffer && http.connected() && (contentLength == 0 || downloaded < contentLength)) {
-                size_t available = stream->available();
-                if (available) {
-                  size_t toRead = min(available, bufferSize);
-                  if (contentLength > 0) {
-                    uint64_t remaining = contentLength - downloaded;
-                    if (remaining < toRead) toRead = (size_t)remaining;
-                  }
-                  int readLen = stream->readBytes(buffer, toRead);
-                  if (readLen <= 0) break;
-
-                  bool writeReady = (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE);
-                  if (!writeReady) {
-                    message = "SD card busy during write";
-                    break;
-                  }
-                  size_t written = out.write(buffer, readLen);
-                  if (sdMutex) xSemaphoreGive(sdMutex);
-                  if (written != (size_t)readLen) {
-                    message = "SD write failed";
-                    break;
-                  }
-                  downloaded += readLen;
-                  unsigned long nowMs = millis();
-                  if (nowMs - lastStatusMs >= PLEX_IMPORT_STATUS_INTERVAL_MS ||
-                      (contentLength > 0 && downloaded >= contentLength)) {
-                    setPlexImportState(true, false, downloaded, contentLength, job->label, destPath, "Downloading");
-                    lastStatusMs = nowMs;
-                  }
-                } else {
-                  delay(1);
-                }
-              }
-              if (buffer) free(buffer);
-              if (message.length() == 0) {
-                if (contentLength > 0 && downloaded < contentLength) {
-                  message = "Download ended early";
-                } else {
-                  ok = true;
-                }
+        for (int requestAttempt = 0; requestAttempt < 2 && message.length() == 0; requestAttempt++) {
+          uint64_t resumeOffset = 0;
+          bool fileReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+          File out;
+          if (fileReady) {
+            if (SD_MMC.exists(tempPath)) {
+              File partial = SD_MMC.open(tempPath, FILE_READ);
+              if (partial) {
+                resumeOffset = partial.size();
+                partial.close();
               }
             }
-            http.end();
+            out = SD_MMC.open(tempPath, resumeOffset > 0 ? FILE_APPEND : FILE_WRITE);
+            if (sdMutex) xSemaphoreGive(sdMutex);
+          }
+          if (!fileReady || !out) {
+            message = fileReady ? "Failed to open destination file" : "SD card busy";
+            break;
           }
 
-          bool closeReady = (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE);
+          downloaded = resumeOffset;
+          WiFiClient client;
+          client.setNoDelay(true);
+          HTTPClient http;
+          http.setTimeout(15000);
+          http.setReuse(true);
+          const char* headers[] = { "Content-Length", "Content-Range" };
+          http.collectHeaders(headers, 2);
+          String url = plexUrlForPath(job->partKey + "?download=1");
+          if (!http.begin(client, url)) {
+            message = "Failed to open Plex URL";
+            out.close();
+            break;
+          }
+          http.addHeader("Accept-Encoding", "identity");
+          if (resumeOffset > 0) {
+            http.addHeader("Range", "bytes=" + String((unsigned long long)resumeOffset) + "-");
+          }
+          int code = http.GET();
+          if (resumeOffset > 0 && code == 200) {
+            http.end();
+            out.close();
+            bool resetReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+            if (resetReady) {
+              SD_MMC.remove(tempPath);
+              if (sdMutex) xSemaphoreGive(sdMutex);
+            } else {
+              message = "SD card busy while restarting download";
+            }
+            continue;
+          }
+          if (code != 200 && code != 206) {
+            message = "Plex download failed: HTTP " + String(code);
+            http.end();
+            out.close();
+            break;
+          }
+
+          String lengthHeader = http.header("Content-Length");
+          uint64_t responseLength = lengthHeader.length()
+            ? strtoull(lengthHeader.c_str(), NULL, 10)
+            : (http.getSize() > 0 ? (uint64_t)http.getSize() : 0);
+          total = responseLength > 0 ? resumeOffset + responseLength : 0;
+          updatePlexJob(job, "running", resumeOffset ? "Resuming" : "Downloading",
+                        downloaded, total, false);
+
+          size_t bufferSize = PLEX_IMPORT_BUFFER_SIZE;
+          uint8_t *buffer = (uint8_t*)malloc(bufferSize);
+          if (!buffer) {
+            bufferSize = 4096;
+            buffer = (uint8_t*)malloc(bufferSize);
+          }
+          if (!buffer) message = "Not enough memory for Plex buffer";
+
+          WiFiClient *stream = http.getStreamPtr();
+          unsigned long lastStatusMs = millis();
+          unsigned long lastPersistMs = millis();
+          while (buffer && http.connected() && (total == 0 || downloaded < total)) {
+            if (job->cancelRequested) {
+              cancelled = true;
+              message = "Cancelled";
+              break;
+            }
+            size_t available = stream->available();
+            if (!available) {
+              delay(1);
+              continue;
+            }
+            size_t toRead = min(available, bufferSize);
+            if (total > 0 && total - downloaded < toRead) toRead = (size_t)(total - downloaded);
+            int readLen = stream->readBytes(buffer, toRead);
+            if (readLen <= 0) break;
+
+            bool writeReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+            if (!writeReady) {
+              message = "SD card busy during write";
+              break;
+            }
+            size_t written = out.write(buffer, readLen);
+            if (sdMutex) xSemaphoreGive(sdMutex);
+            if (written != (size_t)readLen) {
+              message = "SD write failed";
+              break;
+            }
+            downloaded += written;
+            unsigned long nowMs = millis();
+            if (nowMs - lastStatusMs >= PLEX_IMPORT_STATUS_INTERVAL_MS ||
+                (total > 0 && downloaded >= total)) {
+              updatePlexJob(job, "running", "Downloading", downloaded, total, false);
+              lastStatusMs = nowMs;
+            }
+            if (nowMs - lastPersistMs >= PLEX_QUEUE_PERSIST_INTERVAL_MS) {
+              persistPlexImportQueue();
+              lastPersistMs = nowMs;
+            }
+          }
+          if (buffer) free(buffer);
+          http.end();
+
+          bool closeReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
           if (closeReady) {
             out.flush();
             out.close();
-            if (ok) {
-              if (SD_MMC.rename(tempPath, destPath)) {
+            if (!cancelled && message.length() == 0 && (total == 0 || downloaded >= total)) {
+              if (SD_MMC.rename(tempPath, job->destPath)) {
+                ok = true;
                 message = "Complete";
               } else {
-                ok = false;
                 message = "Failed to finalize file";
-                SD_MMC.remove(tempPath);
               }
-            } else {
-              SD_MMC.remove(tempPath);
             }
             if (sdMutex) xSemaphoreGive(sdMutex);
           } else {
-            ok = false;
             message = "SD card busy during close";
           }
+          break;
         }
       }
     }
-  }
 
-  if (ok) {
-    webLogf("success", "[Plex] Import complete: %s", destPath.c_str());
-    if (job->reindexRoot.length()) enqueueIndexUpdateForPath(job->reindexRoot);
-  } else {
-    webLogf("error", "[Plex] Import failed: %s", message.c_str());
+    if (ok) {
+      updatePlexJob(job, "done", "Complete", downloaded, total ? total : downloaded, true);
+      webLogf("success", "[Plex] Import complete: %s", job->destPath.c_str());
+      if (job->reindexRoot.length()) enqueueIndexUpdateForPath(job->reindexRoot);
+    } else if (cancelled || job->cancelRequested) {
+      updatePlexJob(job, "cancelled", "Cancelled; partial file retained", downloaded, total, false);
+      webLogf("info", "[Plex] Import cancelled: %s", job->label.c_str());
+    } else {
+      updatePlexJob(job, "failed", message.length() ? message : "Download ended early",
+                    downloaded, total, false);
+      webLogf("error", "[Plex] Import failed: %s", message.c_str());
+    }
+    persistPlexImportQueue();
   }
-  setPlexImportState(false, ok, downloaded, downloaded, job->label, destPath, message);
-  delete job;
-  vTaskDelete(NULL);
 }
 
 // Return number of connected stations on the softAP
@@ -4919,6 +5153,8 @@ Serial.println("SD Card initialized successfully!");
     settingsReady = true; // signal background tasks the settings are loaded
     Serial.printf("[SETTINGS] autoGenerateMedia = %s\n", settings.autoGenerateMedia ? "true" : "false");
     applyWiFiSettings();
+    loadPlexImportQueue();
+    startPlexImportWorkerIfNeeded();
     applyRGBSettings();
     if (settings.flipScreen) {
       // setup() is still single-threaded here (LVGL tasks not started yet),
@@ -5946,24 +6182,40 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
     request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
     return;
   }
-  PlexImportState copy;
   bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
-  copy = plexImportState;
+  AsyncResponseStream *stream = request->beginResponseStream("application/json");
+  stream->print("{\"active\":");
+  stream->print(plexImportState.active ? "true" : "false");
+  stream->print(",\"workerRunning\":");
+  stream->print(plexImportWorkerRunning ? "true" : "false");
+  stream->print(",\"success\":");
+  stream->print(plexImportState.success ? "true" : "false");
+  stream->printf(",\"downloaded\":%llu", (unsigned long long)plexImportState.downloaded);
+  stream->printf(",\"total\":%llu", (unsigned long long)plexImportState.total);
+  stream->printf(",\"startedMs\":%lu", plexImportState.startedMs);
+  stream->printf(",\"updatedMs\":%lu", plexImportState.updatedMs);
+  stream->print(",\"label\":\"" + jsonEscape(plexImportState.label) + "\"");
+  stream->print(",\"destPath\":\"" + jsonEscape(plexImportState.destPath) + "\"");
+  stream->print(",\"message\":\"" + jsonEscape(plexImportState.message) + "\"");
+  stream->printf(",\"queued\":%u,\"jobs\":[", (unsigned)plexQueuedCountLocked());
+  bool first = true;
+  for (PlexImportJob *job : plexImportJobs) {
+    if (!job) continue;
+    if (!first) stream->print(',');
+    first = false;
+    stream->printf("{\"id\":%u", (unsigned)job->id);
+    stream->print(",\"status\":\"" + jsonEscape(job->status) + "\"");
+    stream->print(",\"success\":");
+    stream->print(job->success ? "true" : "false");
+    stream->printf(",\"downloaded\":%llu", (unsigned long long)job->downloaded);
+    stream->printf(",\"total\":%llu", (unsigned long long)job->total);
+    stream->print(",\"label\":\"" + jsonEscape(job->label) + "\"");
+    stream->print(",\"destPath\":\"" + jsonEscape(job->destPath) + "\"");
+    stream->print(",\"message\":\"" + jsonEscape(job->message) + "\"}");
+  }
+  stream->print("]}");
   if (locked) xSemaphoreGive(plexImportMutex);
-
-  StaticJsonDocument<512> doc;
-  doc["active"] = copy.active;
-  doc["success"] = copy.success;
-  doc["downloaded"] = copy.downloaded;
-  doc["total"] = copy.total;
-  doc["startedMs"] = copy.startedMs;
-  doc["updatedMs"] = copy.updatedMs;
-  doc["label"] = copy.label;
-  doc["destPath"] = copy.destPath;
-  doc["message"] = copy.message;
-  String json;
-  serializeJson(doc, json);
-  request->send(200, "application/json", json);
+  request->send(stream);
 });
 
 server.on("/api/debug/ping", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -6121,14 +6373,6 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
     return;
   }
 
-  bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
-  bool busy = plexImportState.active;
-  if (locked) xSemaphoreGive(plexImportMutex);
-  if (busy) {
-    request->send(409, "application/json", "{\"error\":\"Another Plex import is already running\"}");
-    return;
-  }
-
   StaticJsonDocument<1024> doc;
   DeserializationError error = deserializeJson(doc, request->getParam("body", true)->value());
   if (error) {
@@ -6162,21 +6406,95 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
   }
 
   PlexImportJob *job = new PlexImportJob();
-  job->url = plexUrlForPath(partKey + "?download=1");
+  if (!job) {
+    request->send(503, "application/json", "{\"error\":\"Not enough memory to queue import\"}");
+    return;
+  }
+  job->partKey = partKey;
   job->destDir = destDir;
   job->filename = filename;
   job->label = label;
   job->reindexRoot = reindexRoot;
+  job->destPath = destPath;
 
-  setPlexImportState(true, false, 0, 0, label, destPath, "Queued");
-  BaseType_t created = xTaskCreatePinnedToCore(plexImportTask, "PlexImport", 8192, job, 1, NULL, 0);
-  if (created != pdPASS) {
-    setPlexImportState(false, false, 0, 0, label, destPath, "Failed to start import task");
+  bool locked = plexImportMutex &&
+                xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+  if (plexImportJobs.size() >= PLEX_QUEUE_MAX_JOBS) {
+    if (locked) xSemaphoreGive(plexImportMutex);
     delete job;
-    request->send(500, "application/json", "{\"error\":\"Failed to start import task\"}");
+    request->send(429, "application/json", "{\"error\":\"Plex queue is full; clear completed jobs\"}");
     return;
   }
-  request->send(202, "application/json", "{\"status\":\"queued\"}");
+  job->id = plexImportNextId++;
+  plexImportJobs.push_back(job);
+  if (locked) xSemaphoreGive(plexImportMutex);
+  persistPlexImportQueue();
+  if (!startPlexImportWorkerIfNeeded()) {
+    updatePlexJob(job, "failed", "Failed to start import worker", 0, 0, false);
+    persistPlexImportQueue();
+    request->send(500, "application/json", "{\"error\":\"Failed to start import worker\"}");
+    return;
+  }
+  request->send(202, "application/json",
+                String("{\"status\":\"queued\",\"id\":") + String(job->id) + "}");
+});
+
+server.on("/api/plex/import-action", HTTP_POST, [](AsyncWebServerRequest *request){
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+  String action = request->hasParam("action") ? request->getParam("action")->value() : "";
+  uint32_t id = request->hasParam("id") ? request->getParam("id")->value().toInt() : 0;
+  bool locked = plexImportMutex &&
+                xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(500)) == pdTRUE;
+  if (plexImportMutex && !locked) {
+    request->send(503, "application/json", "{\"error\":\"Queue busy\"}");
+    return;
+  }
+
+  bool changed = false;
+  if (action == "clear") {
+    for (auto it = plexImportJobs.begin(); it != plexImportJobs.end();) {
+      PlexImportJob *job = *it;
+      if (job && job->status != "running" && job->status != "waiting" && job->status != "queued") {
+        delete job;
+        it = plexImportJobs.erase(it);
+        changed = true;
+      } else {
+        ++it;
+      }
+    }
+  } else {
+    PlexImportJob *job = findPlexJobLocked(id);
+    if (!job) {
+      if (locked) xSemaphoreGive(plexImportMutex);
+      request->send(404, "application/json", "{\"error\":\"Import job not found\"}");
+      return;
+    }
+    if (action == "cancel" && (job->status == "queued" || job->status == "waiting" || job->status == "running")) {
+      job->cancelRequested = true;
+      if (job->status == "queued") {
+        job->status = "cancelled";
+        job->message = "Cancelled";
+      }
+      changed = true;
+    } else if (action == "retry" && (job->status == "failed" || job->status == "cancelled")) {
+      job->cancelRequested = false;
+      job->status = "queued";
+      job->message = "Queued to resume";
+      job->success = false;
+      changed = true;
+    }
+  }
+  if (locked) xSemaphoreGive(plexImportMutex);
+  if (!changed) {
+    request->send(409, "application/json", "{\"error\":\"Action is not valid for this job\"}");
+    return;
+  }
+  persistPlexImportQueue();
+  startPlexImportWorkerIfNeeded();
+  request->send(200, "application/json", "{\"status\":\"updated\"}");
 });
 
 // POST /auth/login - verify the SHA-256 password hash and issue a session token.

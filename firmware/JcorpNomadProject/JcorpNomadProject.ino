@@ -350,9 +350,13 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define PLEX_IMPORT_BUFFER_SIZE 16384
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #define HTTP_HEALTH_LOG_INTERVAL_MS 30000UL
+#define HTTP_HEALTH_SAMPLE_INTERVAL_MS 5000UL
 #define HEALTH_LOW_HEAP_WARN_BYTES 25000UL
 #define HEALTH_LOW_HEAP_RESTART_BYTES 18000UL
 #define HEALTH_LOW_HEAP_RESTART_STREAK 10
+#define HEALTH_CRITICAL_MIN_HEAP_BYTES 8000UL
+#define HEALTH_LOW_LARGEST_BLOCK_BYTES 8000UL
+#define HEALTH_CRITICAL_HEAP_STREAK 2
 #define HEALTH_MIN_UPTIME_BEFORE_RESTART_MS 300000UL
 #ifndef NOMAD_AP_CHANNEL
 #define NOMAD_AP_CHANNEL 6
@@ -431,9 +435,15 @@ volatile unsigned long httpLastDebugPingMs = 0;
 volatile unsigned long httpLastDebugStatusMs = 0;
 volatile uint32_t healthLowHeapWarnCount = 0;
 volatile uint32_t healthLowHeapRestartStreak = 0;
+volatile uint32_t healthCriticalHeapCount = 0;
+volatile uint32_t healthCriticalHeapStreak = 0;
+volatile uint32_t healthLowLargestBlockCount = 0;
 volatile unsigned long healthLastLogMs = 0;
 volatile unsigned long healthLastLowHeapMs = 0;
+volatile unsigned long healthLastCriticalHeapMs = 0;
 volatile size_t healthLastFreeHeap = 0;
+volatile size_t healthLastMinFreeHeap = 0;
+volatile size_t healthLastMaxAllocHeap = 0;
 // Set by the /settings handler (async_tcp task); consumed by the task that owns
 // LVGL flushes. MADCTL must never be written mid-flush from another task.
 volatile bool lcdRotatePending = false;
@@ -6064,10 +6074,18 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   http["healthLastLogAgeMs"] = healthLastLogMs > 0 ? nowMs - healthLastLogMs : 0;
   http["lowHeapWarnCount"] = healthLowHeapWarnCount;
   http["lowHeapRestartStreak"] = healthLowHeapRestartStreak;
+  http["criticalHeapCount"] = healthCriticalHeapCount;
+  http["criticalHeapStreak"] = healthCriticalHeapStreak;
+  http["lowLargestBlockCount"] = healthLowLargestBlockCount;
   http["lastLowHeapAgeMs"] = healthLastLowHeapMs > 0 ? nowMs - healthLastLowHeapMs : 0;
+  http["lastCriticalHeapAgeMs"] = healthLastCriticalHeapMs > 0 ? nowMs - healthLastCriticalHeapMs : 0;
   http["lastFreeHeap"] = healthLastFreeHeap;
+  http["lastMinFreeHeap"] = healthLastMinFreeHeap;
+  http["lastMaxAllocHeap"] = healthLastMaxAllocHeap;
   http["lowHeapWarnBytes"] = HEALTH_LOW_HEAP_WARN_BYTES;
   http["lowHeapRestartBytes"] = HEALTH_LOW_HEAP_RESTART_BYTES;
+  http["criticalMinHeapBytes"] = HEALTH_CRITICAL_MIN_HEAP_BYTES;
+  http["lowLargestBlockBytes"] = HEALTH_LOW_LARGEST_BLOCK_BYTES;
 
   JsonObject plex = doc.createNestedObject("plexImport");
   plex["active"] = importCopy.active;
@@ -6985,10 +7003,55 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
     t = xTaskCreatePinnedToCore(+[](void *param){
       (void)param;
       unsigned long lastLogMs = 0;
+      unsigned long lastSampleMs = 0;
       for (;;) {
         unsigned long nowMs = millis();
-        size_t freeHeap = ESP.getFreeHeap();
-        healthLastFreeHeap = freeHeap;
+        if (nowMs - lastSampleMs >= HTTP_HEALTH_SAMPLE_INTERVAL_MS) {
+          lastSampleMs = nowMs;
+          size_t freeHeap = ESP.getFreeHeap();
+          size_t minHeap = ESP.getMinFreeHeap();
+          size_t maxAlloc = ESP.getMaxAllocHeap();
+          healthLastFreeHeap = freeHeap;
+          healthLastMinFreeHeap = minHeap;
+          healthLastMaxAllocHeap = maxAlloc;
+
+          if (freeHeap < HEALTH_LOW_HEAP_WARN_BYTES || minHeap < HEALTH_LOW_HEAP_WARN_BYTES) {
+            healthLowHeapWarnCount++;
+            healthLastLowHeapMs = nowMs;
+          }
+          if (freeHeap < HEALTH_LOW_HEAP_RESTART_BYTES) {
+            healthLowHeapRestartStreak++;
+          } else {
+            healthLowHeapRestartStreak = 0;
+          }
+          if (minHeap < HEALTH_CRITICAL_MIN_HEAP_BYTES) {
+            healthCriticalHeapCount++;
+            healthCriticalHeapStreak++;
+            healthLastCriticalHeapMs = nowMs;
+          } else {
+            healthCriticalHeapStreak = 0;
+          }
+          if (maxAlloc > 0 && maxAlloc < HEALTH_LOW_LARGEST_BLOCK_BYTES) {
+            healthLowLargestBlockCount++;
+          }
+
+          bool shouldRestartForCurrentHeap =
+            healthLowHeapRestartStreak >= HEALTH_LOW_HEAP_RESTART_STREAK;
+          bool shouldRestartForLowWater =
+            healthCriticalHeapStreak >= HEALTH_CRITICAL_HEAP_STREAK;
+          if (nowMs > HEALTH_MIN_UPTIME_BEFORE_RESTART_MS &&
+              (shouldRestartForCurrentHeap || shouldRestartForLowWater) &&
+              !plexImportActiveSnapshot()) {
+            Serial.printf("[HEALTH] heap watchdog restart: free=%u min=%u largest=%u lowStreak=%u criticalStreak=%u\n",
+                          (unsigned)freeHeap,
+                          (unsigned)minHeap,
+                          (unsigned)maxAlloc,
+                          (unsigned)healthLowHeapRestartStreak,
+                          (unsigned)healthCriticalHeapStreak);
+            delay(100);
+            ESP.restart();
+          }
+        }
 
         if (nowMs - lastLogMs >= HTTP_HEALTH_LOG_INTERVAL_MS) {
           lastLogMs = nowMs;
@@ -6998,21 +7061,11 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
             sdMutexFreeForLog = (xSemaphoreTake(sdMutex, 0) == pdTRUE);
             if (sdMutexFreeForLog) xSemaphoreGive(sdMutex);
           }
-          if (freeHeap < HEALTH_LOW_HEAP_WARN_BYTES) {
-            healthLowHeapWarnCount++;
-            healthLastLowHeapMs = nowMs;
-          }
-          if (freeHeap < HEALTH_LOW_HEAP_RESTART_BYTES) {
-            healthLowHeapRestartStreak++;
-          } else {
-            healthLowHeapRestartStreak = 0;
-          }
-
-          Serial.printf("[HEALTH] up=%lu heap=%u minHeap=%u largest=%u psram=%u wifi=%d rssi=%d apClients=%u sdMutex=%s index=%d queue=%u streams=%d plex=%d lowHeapWarns=%u lowHeapStreak=%u\n",
+          Serial.printf("[HEALTH] up=%lu heap=%u minHeap=%u largest=%u psram=%u wifi=%d rssi=%d apClients=%u sdMutex=%s index=%d queue=%u streams=%d plex=%d lowHeapWarns=%u lowHeapStreak=%u critical=%u/%u lowLargest=%u\n",
                         nowMs,
-                        (unsigned)freeHeap,
-                        (unsigned)ESP.getMinFreeHeap(),
-                        (unsigned)ESP.getMaxAllocHeap(),
+                        (unsigned)healthLastFreeHeap,
+                        (unsigned)healthLastMinFreeHeap,
+                        (unsigned)healthLastMaxAllocHeap,
                         (unsigned)ESP.getFreePsram(),
                         (int)WiFi.status(),
                         WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
@@ -7023,17 +7076,10 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
                         activeStreams,
                         plexImportActiveSnapshot() ? 1 : 0,
                         (unsigned)healthLowHeapWarnCount,
-                        (unsigned)healthLowHeapRestartStreak);
-
-          if (nowMs > HEALTH_MIN_UPTIME_BEFORE_RESTART_MS &&
-              healthLowHeapRestartStreak >= HEALTH_LOW_HEAP_RESTART_STREAK &&
-              !plexImportActiveSnapshot()) {
-            Serial.printf("[HEALTH] free heap stayed below %u bytes for %u checks; restarting device\n",
-                          (unsigned)HEALTH_LOW_HEAP_RESTART_BYTES,
-                          (unsigned)healthLowHeapRestartStreak);
-            delay(100);
-            ESP.restart();
-          }
+                        (unsigned)healthLowHeapRestartStreak,
+                        (unsigned)healthCriticalHeapCount,
+                        (unsigned)healthCriticalHeapStreak,
+                        (unsigned)healthLowLargestBlockCount);
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));

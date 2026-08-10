@@ -385,12 +385,14 @@ struct AdminSettings {
   bool homeWifiEnabled = false;
   String plexUrl = "";
   String plexToken = "";
+  bool bulkTransferMode = false;
   int brightness = 100;            // percent 0-100 (Set_Backlight range); 230 was out-of-range and ignored
   bool autoGenerateMedia = true;   // check for new files on boot (default on)
   bool flipScreen = false;         // rotate LCD 180 deg (USB port upside down, e.g. car mounts)
 };
 
 AdminSettings settings;
+volatile bool bulkTransferActive = false;
 bool firmwareBuildChanged = false;
 unsigned long homeWifiConnectStartedMs = 0;
 String homeWifiLastMessage = "Home WiFi disabled";
@@ -1803,6 +1805,7 @@ bool loadSettings() {
   settings.homeWifiEnabled = doc["homeWifiEnabled"] | false;
   settings.plexUrl = doc["plexUrl"] | "";
   settings.plexToken = doc["plexToken"] | "";
+  settings.bulkTransferMode = doc["bulkTransferMode"] | false;
   settings.brightness = doc["brightness"] | 100;
   // brightness is 0-100 (Set_Backlight ignores >100). old builds defaulted to 230, clamp it
   settings.brightness = constrain(settings.brightness, 0, 100);
@@ -1842,6 +1845,7 @@ bool saveSettings() {
   doc["homeWifiEnabled"] = settings.homeWifiEnabled;
   doc["plexUrl"] = settings.plexUrl;
   doc["plexToken"] = settings.plexToken;
+  doc["bulkTransferMode"] = settings.bulkTransferMode;
   doc["brightness"] = settings.brightness;
   doc["autoGenerateMedia"] = settings.autoGenerateMedia;
   doc["flipScreen"] = settings.flipScreen;
@@ -4592,6 +4596,11 @@ void plexImportTask(void *pvParameters) {
     if (locked) xSemaphoreGive(plexImportMutex);
 
     if (!job) {
+      if (bulkTransferActive) {
+        bulkTransferActive = false;
+        startBackgroundTasksIfNeeded();
+        webLog("[Plex] Bulk transfer mode released", "success");
+      }
       plexImportWorkerRunning = false;
       plexImportState.active = false;
       vTaskDeleteWithCaps(NULL);
@@ -4606,6 +4615,26 @@ void plexImportTask(void *pvParameters) {
       updatePlexJob(job, "cancelled", "Cancelled", job->downloaded, job->total, false);
       persistPlexImportQueue();
       continue;
+    }
+
+    if (settings.bulkTransferMode) {
+      while ((indexingInProgress || indexingTasksActive || sdScanInProgress) &&
+             !job->cancelRequested) {
+        updatePlexJob(job, "waiting", "Waiting for background storage work",
+                      job->downloaded, job->total, false);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+      }
+      if (job->cancelRequested) {
+        updatePlexJob(job, "cancelled", "Cancelled", job->downloaded, job->total, false);
+        persistPlexImportQueue();
+        continue;
+      }
+      if (!bulkTransferActive) {
+        shutdownBackgroundTasksForStreaming();
+        bulkTransferActive = true;
+        WiFi.setSleep(false);
+        webLog("[Plex] Bulk transfer mode active; offline AP remains available", "info");
+      }
     }
 
     String pathError;
@@ -6624,6 +6653,7 @@ server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
   doc["homeWifiRSSI"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
   doc["homeWifiStatus"] = homeWifiStatusText();
   doc["homeWifiStatusDetail"] = homeWifiStatusDetail();
+  doc["bulkTransferMode"] = settings.bulkTransferMode;
   if (checkAdminAuth(request)) {
     doc["wifiPassword"] = settings.wifiPassword;
     doc["homeWifiPassword"] = settings.homeWifiPassword;
@@ -6675,6 +6705,7 @@ server.on("/settings", HTTP_POST, [](AsyncWebServerRequest *request){
   if (doc.containsKey("wifiPassword")) settings.wifiPassword = doc["wifiPassword"].as<String>();
   if (doc.containsKey("plexUrl")) settings.plexUrl = doc["plexUrl"].as<String>();
   if (doc.containsKey("plexToken")) settings.plexToken = doc["plexToken"].as<String>();
+  if (doc.containsKey("bulkTransferMode")) settings.bulkTransferMode = doc["bulkTransferMode"].as<bool>();
   bool homeWifiChanged = false;
   if (doc.containsKey("homeWifiSSID")) {
     settings.homeWifiSSID = doc["homeWifiSSID"].as<String>();
@@ -6942,6 +6973,8 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   tasks["indexingTasksActive"] = indexingTasksActive;
   tasks["requestIndexing"] = requestIndexing;
   tasks["backgroundShutdown"] = shutdownBackgroundTasks;
+  tasks["bulkTransferConfigured"] = settings.bulkTransferMode;
+  tasks["bulkTransferActive"] = bulkTransferActive;
   tasks["indexQueueDepth"] = queueDepth;
   tasks["currentIndexPath"] = currentPath;
   tasks["currentBucketNum"] = bucketNum;
@@ -8083,7 +8116,9 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
       size_t observedMinHeap = SIZE_MAX;
       for (;;) {
         unsigned long nowMs = millis();
-        if (nowMs - lastSampleMs >= HTTP_HEALTH_SAMPLE_INTERVAL_MS) {
+        unsigned long sampleInterval = bulkTransferActive
+          ? 15000UL : HTTP_HEALTH_SAMPLE_INTERVAL_MS;
+        if (nowMs - lastSampleMs >= sampleInterval) {
           lastSampleMs = nowMs;
           size_t freeHeap = ESP.getFreeHeap();
           size_t minHeap = ESP.getMinFreeHeap();
@@ -8150,7 +8185,9 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
           }
         }
 
-        if (nowMs - lastLogMs >= HTTP_HEALTH_LOG_INTERVAL_MS) {
+        unsigned long logInterval = bulkTransferActive
+          ? 120000UL : HTTP_HEALTH_LOG_INTERVAL_MS;
+        if (nowMs - lastLogMs >= logInterval) {
           lastLogMs = nowMs;
           healthLastLogMs = nowMs;
           bool sdMutexFreeForLog = true;
@@ -8198,12 +8235,14 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
       for (;;) {
         uint32_t now = millis();
 
-        if (now - lastUpdateTimeLocal > 2000) { // every 2s
+        uint32_t uiInterval = bulkTransferActive ? 10000UL : 2000UL;
+        if (now - lastUpdateTimeLocal > uiInterval) {
           updateToggleStatus();
           lastUpdateTimeLocal = now;
         }
 
-        if (now - lastTempReadingLocal > 12000) { // every 12s
+        uint32_t tempInterval = bulkTransferActive ? 60000UL : 12000UL;
+        if (now - lastTempReadingLocal > tempInterval) {
           currentTempC = temperatureRead();
           lastTempReadingLocal = now;
         }

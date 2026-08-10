@@ -482,6 +482,36 @@ struct PsramResponseBuffer {
   }
 };
 
+static constexpr uint32_t RESTART_SNAPSHOT_MAGIC = 0x4E4F4D44UL;
+static constexpr uint16_t RESTART_SNAPSHOT_VERSION = 1;
+
+struct RestartSnapshot {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint32_t bootCount;
+  uint32_t uptimeMs;
+  uint32_t freeHeap;
+  uint32_t minFreeHeap;
+  uint32_t maxAllocHeap;
+  uint32_t lowHeapWarnCount;
+  uint32_t criticalHeapCount;
+  uint8_t plexActive;
+  uint8_t indexingActive;
+  uint8_t sdScanActive;
+  uint8_t activeStreams;
+  char operation[32];
+  char intent[48];
+  char buildId[24];
+};
+
+RTC_NOINIT_ATTR RestartSnapshot rtcRestartSnapshot;
+RestartSnapshot previousRestartSnapshot;
+bool previousRestartSnapshotValid = false;
+uint32_t persistentBootCount = 0;
+uint32_t controlledRestartCount = 0;
+esp_reset_reason_t currentResetReason = ESP_RST_UNKNOWN;
+
 class PsramBufferPrint : public Print {
  public:
   explicit PsramBufferPrint(PsramResponseBuffer &buffer) : buffer_(buffer) {}
@@ -524,6 +554,10 @@ bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
 void printJsonEscapedTo(Print &out, const String &value);
 bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
                        const std::shared_ptr<PsramResponseBuffer> &body);
+const char* resetReasonName(esp_reset_reason_t reason);
+void initRestartDiagnostics();
+void updateRestartSnapshot(const char *operation);
+void recordRestartIntent(const char *intent);
 volatile unsigned long httpDebugPingCount = 0;
 volatile unsigned long httpDebugStatusCount = 0;
 volatile unsigned long httpLastDebugPingMs = 0;
@@ -771,6 +805,114 @@ bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
   response->addHeader("Cache-Control", "no-store");
   request->send(response);
   return true;
+}
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external-reset";
+    case ESP_RST_SW: return "software-restart";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT: return "task-watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
+
+void updateRestartSnapshot(const char *operation) {
+  rtcRestartSnapshot.magic = RESTART_SNAPSHOT_MAGIC;
+  rtcRestartSnapshot.version = RESTART_SNAPSHOT_VERSION;
+  rtcRestartSnapshot.bootCount = persistentBootCount;
+  rtcRestartSnapshot.uptimeMs = millis();
+  rtcRestartSnapshot.freeHeap = ESP.getFreeHeap();
+  rtcRestartSnapshot.minFreeHeap = ESP.getMinFreeHeap();
+  rtcRestartSnapshot.maxAllocHeap = ESP.getMaxAllocHeap();
+  rtcRestartSnapshot.lowHeapWarnCount = healthLowHeapWarnCount;
+  rtcRestartSnapshot.criticalHeapCount = healthCriticalHeapCount;
+  if (operation && operation[0]) {
+    strlcpy(rtcRestartSnapshot.operation, operation, sizeof(rtcRestartSnapshot.operation));
+  }
+  strlcpy(rtcRestartSnapshot.buildId, NOMAD_FIRMWARE_BUILD_ID,
+          sizeof(rtcRestartSnapshot.buildId));
+}
+
+void initRestartDiagnostics() {
+  currentResetReason = esp_reset_reason();
+  bool rtcValid = rtcRestartSnapshot.magic == RESTART_SNAPSHOT_MAGIC &&
+                  rtcRestartSnapshot.version == RESTART_SNAPSHOT_VERSION;
+
+  Preferences diagnostics;
+  diagnostics.begin("nomad_diag", false);
+  persistentBootCount = diagnostics.getUInt("boot_count", 0) + 1;
+  controlledRestartCount = diagnostics.getUInt("ctrl_count", 0);
+
+  if (rtcValid) {
+    previousRestartSnapshot = rtcRestartSnapshot;
+    previousRestartSnapshotValid = true;
+    diagnostics.putBool("prev_valid", true);
+    diagnostics.putUInt("prev_up", previousRestartSnapshot.uptimeMs);
+    diagnostics.putUInt("prev_free", previousRestartSnapshot.freeHeap);
+    diagnostics.putUInt("prev_min", previousRestartSnapshot.minFreeHeap);
+    diagnostics.putUInt("prev_max", previousRestartSnapshot.maxAllocHeap);
+    diagnostics.putUInt("prev_warn", previousRestartSnapshot.lowHeapWarnCount);
+    diagnostics.putUInt("prev_crit", previousRestartSnapshot.criticalHeapCount);
+    uint32_t flags = previousRestartSnapshot.plexActive |
+                     (previousRestartSnapshot.indexingActive << 8) |
+                     (previousRestartSnapshot.sdScanActive << 16) |
+                     (previousRestartSnapshot.activeStreams << 24);
+    diagnostics.putUInt("prev_flags", flags);
+    diagnostics.putString("prev_op", previousRestartSnapshot.operation);
+    diagnostics.putString("prev_intent", previousRestartSnapshot.intent);
+    diagnostics.putString("prev_build", previousRestartSnapshot.buildId);
+  } else if (diagnostics.getBool("prev_valid", false)) {
+    previousRestartSnapshot.magic = RESTART_SNAPSHOT_MAGIC;
+    previousRestartSnapshot.version = RESTART_SNAPSHOT_VERSION;
+    previousRestartSnapshot.uptimeMs = diagnostics.getUInt("prev_up", 0);
+    previousRestartSnapshot.freeHeap = diagnostics.getUInt("prev_free", 0);
+    previousRestartSnapshot.minFreeHeap = diagnostics.getUInt("prev_min", 0);
+    previousRestartSnapshot.maxAllocHeap = diagnostics.getUInt("prev_max", 0);
+    previousRestartSnapshot.lowHeapWarnCount = diagnostics.getUInt("prev_warn", 0);
+    previousRestartSnapshot.criticalHeapCount = diagnostics.getUInt("prev_crit", 0);
+    uint32_t flags = diagnostics.getUInt("prev_flags", 0);
+    previousRestartSnapshot.plexActive = flags & 0xFF;
+    previousRestartSnapshot.indexingActive = (flags >> 8) & 0xFF;
+    previousRestartSnapshot.sdScanActive = (flags >> 16) & 0xFF;
+    previousRestartSnapshot.activeStreams = (flags >> 24) & 0xFF;
+    String value = diagnostics.getString("prev_op", "unknown");
+    strlcpy(previousRestartSnapshot.operation, value.c_str(), sizeof(previousRestartSnapshot.operation));
+    value = diagnostics.getString("prev_intent", "");
+    strlcpy(previousRestartSnapshot.intent, value.c_str(), sizeof(previousRestartSnapshot.intent));
+    value = diagnostics.getString("prev_build", "");
+    strlcpy(previousRestartSnapshot.buildId, value.c_str(), sizeof(previousRestartSnapshot.buildId));
+    previousRestartSnapshotValid = true;
+  }
+
+  diagnostics.putUInt("boot_count", persistentBootCount);
+  diagnostics.putUChar("last_reset", (uint8_t)currentResetReason);
+  diagnostics.putString("last_build", NOMAD_FIRMWARE_BUILD_ID);
+  diagnostics.end();
+
+  memset(&rtcRestartSnapshot, 0, sizeof(rtcRestartSnapshot));
+  updateRestartSnapshot("boot");
+  Serial.printf("[DIAG] boot=%u reset=%s previousSnapshot=%s\n",
+                (unsigned)persistentBootCount, resetReasonName(currentResetReason),
+                previousRestartSnapshotValid ? "yes" : "no");
+}
+
+void recordRestartIntent(const char *intent) {
+  updateRestartSnapshot(intent && intent[0] ? intent : "restart");
+  strlcpy(rtcRestartSnapshot.intent, intent ? intent : "restart",
+          sizeof(rtcRestartSnapshot.intent));
+  controlledRestartCount++;
+  Preferences diagnostics;
+  if (diagnostics.begin("nomad_diag", false)) {
+    diagnostics.putUInt("ctrl_count", controlledRestartCount);
+    diagnostics.end();
+  }
 }
 
 String htmlEscape(const String &in) {
@@ -5226,6 +5368,7 @@ void setup() {
     Serial.begin(115200);
     delay(100);
     Serial.println("=== Booting Nomad (debug) ===");
+    initRestartDiagnostics();
     // Crash Diagnostic, checks what went wrong, and helps me when yall send me logs.
     {
       esp_reset_reason_t rr = esp_reset_reason();
@@ -6584,7 +6727,7 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
       (float)importCopy.downloaded * 1000.0f / (float)(nowMs - importCopy.startedMs);
   }
 
-  StaticJsonDocument<3072> doc;
+  StaticJsonDocument<4096> doc;
   doc["buildId"] = NOMAD_FIRMWARE_BUILD_ID;
   doc["buildColor"] = firmwareBuildColor();
   doc["uptimeMs"] = nowMs;
@@ -6595,6 +6738,29 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   doc["minFreePsram"] = ESP.getMinFreePsram();
   doc["maxAllocPsram"] = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
   doc["cpuMhz"] = ESP.getCpuFreqMHz();
+
+  JsonObject restart = doc.createNestedObject("restart");
+  restart["bootCount"] = persistentBootCount;
+  restart["controlledRestartCount"] = controlledRestartCount;
+  restart["currentResetReason"] = (int)currentResetReason;
+  restart["currentResetReasonName"] = resetReasonName(currentResetReason);
+  restart["previousSnapshotValid"] = previousRestartSnapshotValid;
+  if (previousRestartSnapshotValid) {
+    restart["previousBootCount"] = previousRestartSnapshot.bootCount;
+    restart["previousUptimeMs"] = previousRestartSnapshot.uptimeMs;
+    restart["previousFreeHeap"] = previousRestartSnapshot.freeHeap;
+    restart["previousMinFreeHeap"] = previousRestartSnapshot.minFreeHeap;
+    restart["previousMaxAllocHeap"] = previousRestartSnapshot.maxAllocHeap;
+    restart["previousLowHeapWarnCount"] = previousRestartSnapshot.lowHeapWarnCount;
+    restart["previousCriticalHeapCount"] = previousRestartSnapshot.criticalHeapCount;
+    restart["previousOperation"] = previousRestartSnapshot.operation;
+    restart["previousIntent"] = previousRestartSnapshot.intent;
+    restart["previousBuildId"] = previousRestartSnapshot.buildId;
+    restart["previousPlexActive"] = previousRestartSnapshot.plexActive != 0;
+    restart["previousIndexingActive"] = previousRestartSnapshot.indexingActive != 0;
+    restart["previousSdScanActive"] = previousRestartSnapshot.sdScanActive != 0;
+    restart["previousActiveStreams"] = previousRestartSnapshot.activeStreams;
+  }
 
   JsonObject wifi = doc.createNestedObject("wifi");
   wifi["mode"] = (int)WiFi.getMode();
@@ -7045,6 +7211,7 @@ server.on("/auth/logout", HTTP_POST, [](AsyncWebServerRequest *request){
     if (!checkAdminAuth(request)) { request->send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
     webLogf("info", "Restart requested");
     request->send(200, "text/plain", "Rebooting...");
+    recordRestartIntent("admin-restart");
     delay(1000);
     ESP.restart();
   });
@@ -7574,6 +7741,7 @@ server.on("/auth/logout", HTTP_POST, [](AsyncWebServerRequest *request){
         delay(50);
       }
 
+      recordRestartIntent("flash-mode");
   #if defined(ARDUINO_ARCH_ESP32)
       Serial.println(">>> Writing force-download flag and restarting (RTC_CNTL_FORCE_DOWNLOAD_BOOT).");
       REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
@@ -7590,6 +7758,7 @@ server.on("/auth/logout", HTTP_POST, [](AsyncWebServerRequest *request){
     request->send(200, "text/plain", "OK: entering USB MSC mode...");
     delay(200);                 
     set_boot_mode(USB_MODE);
+    recordRestartIntent("usb-mode");
     ESP.restart();             
   });
 
@@ -7653,6 +7822,20 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
           healthLastMinFreeHeap = minHeap;
           healthLastMaxAllocHeap = maxAlloc;
 
+          const char *activeOperation = "idle";
+          if (plexImportActiveSnapshot()) activeOperation = "plex-import";
+          else if (sdScanInProgress) activeOperation = "sd-scan";
+          else if (indexingInProgress || indexingTasksActive || requestIndexing) activeOperation = "indexing";
+          else if (activeStreams > 0) activeOperation = "media-streaming";
+          updateRestartSnapshot(activeOperation);
+          rtcRestartSnapshot.plexActive = plexImportActiveSnapshot() ? 1 : 0;
+          rtcRestartSnapshot.indexingActive =
+            (indexingInProgress || indexingTasksActive || requestIndexing) ? 1 : 0;
+          rtcRestartSnapshot.sdScanActive = sdScanInProgress ? 1 : 0;
+          int streamSnapshot = activeStreams;
+          rtcRestartSnapshot.activeStreams =
+            (uint8_t)constrain(streamSnapshot, 0, 255);
+
           if (freeHeap < HEALTH_LOW_HEAP_WARN_BYTES) {
             healthLowHeapWarnCount++;
             healthLastLowHeapMs = nowMs;
@@ -7691,6 +7874,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
                           (unsigned)maxAlloc,
                           (unsigned)healthLowHeapRestartStreak,
                           (unsigned)healthCriticalHeapStreak);
+            recordRestartIntent("heap-watchdog");
             delay(100);
             ESP.restart();
           }
@@ -7833,6 +8017,7 @@ void loop() {
     if (bootButtonPressed) {
       bootButtonPressed = false;
       set_boot_mode(USB_MODE);
+      recordRestartIntent("boot-button-usb");
       ESP.restart();
     }
     dnsServer.processNextRequest();

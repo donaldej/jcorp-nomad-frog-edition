@@ -20,7 +20,10 @@
 #include "RGB_lamp.h"
 #include <SPIFFS.h>
 #include <Preferences.h>
+#include <Update.h>
 #include "esp_wifi.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "freertos/idf_additions.h"
 #if defined(ARDUINO_ARCH_ESP32)
   #include "soc/soc.h"
@@ -558,6 +561,9 @@ const char* resetReasonName(esp_reset_reason_t reason);
 void initRestartDiagnostics();
 void updateRestartSnapshot(const char *operation);
 void recordRestartIntent(const char *intent);
+bool plexImportActiveSnapshot();
+void initOtaBootGuard();
+void startOtaValidationTask();
 volatile unsigned long httpDebugPingCount = 0;
 volatile unsigned long httpDebugStatusCount = 0;
 volatile unsigned long httpLastDebugPingMs = 0;
@@ -573,6 +579,22 @@ volatile unsigned long healthLastCriticalHeapMs = 0;
 volatile size_t healthLastFreeHeap = 0;
 volatile size_t healthLastMinFreeHeap = 0;
 volatile size_t healthLastMaxAllocHeap = 0;
+volatile bool otaUploadInProgress = false;
+volatile bool otaValidationPending = false;
+volatile unsigned long otaRestartAtMs = 0;
+uint32_t otaBootAttempts = 0;
+uint32_t otaPreviousPartitionAddress = 0;
+
+struct OtaUploadContext {
+  bool authorized = false;
+  bool started = false;
+  bool success = false;
+  int status = 500;
+  size_t bytesWritten = 0;
+  String error;
+};
+
+std::map<AsyncWebServerRequest *, OtaUploadContext *> otaUploads;
 // Set by the /settings handler (async_tcp task); consumed by the task that owns
 // LVGL flushes. MADCTL must never be written mid-flush from another task.
 volatile bool lcdRotatePending = false;
@@ -912,6 +934,126 @@ void recordRestartIntent(const char *intent) {
   if (diagnostics.begin("nomad_diag", false)) {
     diagnostics.putUInt("ctrl_count", controlledRestartCount);
     diagnostics.end();
+  }
+}
+
+const esp_partition_t *findAppPartitionByAddress(uint32_t address) {
+  esp_partition_iterator_t iterator = esp_partition_find(
+    ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, NULL);
+  while (iterator) {
+    const esp_partition_t *partition = esp_partition_get(iterator);
+    if (partition && partition->address == address) {
+      esp_partition_iterator_release(iterator);
+      return partition;
+    }
+    iterator = esp_partition_next(iterator);
+  }
+  return NULL;
+}
+
+void clearOtaBootGuard() {
+  Preferences ota;
+  if (ota.begin("nomad_ota", false)) {
+    ota.putBool("pending", false);
+    ota.putUInt("attempts", 0);
+    ota.end();
+  }
+  otaValidationPending = false;
+  otaBootAttempts = 0;
+}
+
+bool armOtaBootGuard() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (!running) return false;
+
+  Preferences ota;
+  if (!ota.begin("nomad_ota", false)) return false;
+  bool ok = ota.putUInt("prev_addr", running->address) == sizeof(uint32_t);
+  ok = ota.putUInt("attempts", 0) == sizeof(uint32_t) && ok;
+  ok = ota.putBool("pending", true) == sizeof(uint8_t) && ok;
+  ota.end();
+
+  if (ok) {
+    otaPreviousPartitionAddress = running->address;
+    otaBootAttempts = 0;
+  }
+  return ok;
+}
+
+void initOtaBootGuard() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  Preferences ota;
+  if (!ota.begin("nomad_ota", false)) return;
+
+  bool pending = ota.getBool("pending", false);
+  otaPreviousPartitionAddress = ota.getUInt("prev_addr", 0);
+  otaBootAttempts = ota.getUInt("attempts", 0);
+
+  if (!pending || !running || otaPreviousPartitionAddress == 0) {
+    otaValidationPending = false;
+    ota.end();
+    return;
+  }
+
+  if (running->address == otaPreviousPartitionAddress) {
+    ota.putBool("pending", false);
+    ota.putUInt("attempts", 0);
+    otaValidationPending = false;
+    otaBootAttempts = 0;
+    ota.end();
+    Serial.println("[OTA] Previous firmware is active; rollback guard cleared");
+    return;
+  }
+
+  otaBootAttempts++;
+  ota.putUInt("attempts", otaBootAttempts);
+  otaValidationPending = true;
+
+  if (otaBootAttempts >= 2) {
+    const esp_partition_t *previous = findAppPartitionByAddress(otaPreviousPartitionAddress);
+    if (previous && esp_ota_set_boot_partition(previous) == ESP_OK) {
+      ota.putBool("pending", false);
+      ota.putUInt("attempts", 0);
+      ota.end();
+      otaValidationPending = false;
+      Serial.printf("[OTA] Validation failed; rolling back to %s at 0x%08x\n",
+                    previous->label, (unsigned)previous->address);
+      recordRestartIntent("ota-rollback");
+      delay(100);
+      ESP.restart();
+      return;
+    }
+    Serial.println("[OTA] Rollback requested but previous partition was unavailable");
+  }
+
+  ota.end();
+  Serial.printf("[OTA] New image awaiting validation (attempt %u)\n",
+                (unsigned)otaBootAttempts);
+}
+
+void markOtaBootHealthy() {
+  if (!otaValidationPending) return;
+  esp_err_t result = esp_ota_mark_app_valid_cancel_rollback();
+  clearOtaBootGuard();
+  Serial.printf("[OTA] Firmware validated after stable boot window (result=%d)\n",
+                (int)result);
+  webLog("[OTA] Firmware update validated", "success");
+}
+
+void startOtaValidationTask() {
+  if (!otaValidationPending) return;
+  BaseType_t result = xTaskCreatePinnedToCore(+[](void *param) {
+    (void)param;
+    vTaskDelay(pdMS_TO_TICKS(30000));
+    if (ESP.getFreeHeap() >= HEALTH_LOW_HEAP_WARN_BYTES && !otaUploadInProgress) {
+      markOtaBootHealthy();
+    } else {
+      Serial.println("[OTA] Validation deferred because device health is degraded");
+    }
+    vTaskDelete(NULL);
+  }, "OtaValidate", 3072, NULL, 1, NULL, 0);
+  if (result != pdPASS) {
+    Serial.println("[OTA] Failed to start validation task; rollback guard remains armed");
   }
 }
 
@@ -5369,6 +5511,7 @@ void setup() {
     delay(100);
     Serial.println("=== Booting Nomad (debug) ===");
     initRestartDiagnostics();
+    initOtaBootGuard();
     // Crash Diagnostic, checks what went wrong, and helps me when yall send me logs.
     {
       esp_reset_reason_t rr = esp_reset_reason();
@@ -6762,6 +6905,18 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
     restart["previousActiveStreams"] = previousRestartSnapshot.activeStreams;
   }
 
+  const esp_partition_t *runningPartition = esp_ota_get_running_partition();
+  const esp_partition_t *nextPartition = esp_ota_get_next_update_partition(NULL);
+  JsonObject ota = doc.createNestedObject("ota");
+  ota["uploadInProgress"] = otaUploadInProgress;
+  ota["validationPending"] = otaValidationPending;
+  ota["bootAttempts"] = otaBootAttempts;
+  ota["previousPartitionAddress"] = otaPreviousPartitionAddress;
+  ota["runningPartition"] = runningPartition ? runningPartition->label : "unknown";
+  ota["runningPartitionAddress"] = runningPartition ? runningPartition->address : 0;
+  ota["nextPartition"] = nextPartition ? nextPartition->label : "unavailable";
+  ota["nextPartitionSize"] = nextPartition ? nextPartition->size : 0;
+
   JsonObject wifi = doc.createNestedObject("wifi");
   wifi["mode"] = (int)WiFi.getMode();
   wifi["status"] = (int)WiFi.status();
@@ -7718,6 +7873,121 @@ server.on("/auth/logout", HTTP_POST, [](AsyncWebServerRequest *request){
 
     request->send(200, "application/json", json);
   });
+  server.on("/api/firmware/update", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      auto it = otaUploads.find(request);
+      if (it == otaUploads.end()) {
+        request->send(400, "application/json", "{\"error\":\"No firmware image received\"}");
+        return;
+      }
+
+      OtaUploadContext *context = it->second;
+      otaUploads.erase(it);
+      otaUploadInProgress = false;
+      bool success = context->success;
+      int status = context->status;
+      String error = context->error;
+      size_t bytesWritten = context->bytesWritten;
+      delete context;
+
+      if (!success) {
+        clearOtaBootGuard();
+        String body = String("{\"error\":\"") + jsonEscape(error) +
+                      "\",\"bytesWritten\":" + String(bytesWritten) + "}";
+        request->send(status, "application/json", body);
+        return;
+      }
+
+      String body = String("{\"status\":\"Firmware accepted; rebooting\",\"bytesWritten\":") +
+                    String(bytesWritten) + "}";
+      AsyncWebServerResponse *response = request->beginResponse(200, "application/json", body);
+      response->addHeader("Connection", "close");
+      request->send(response);
+      webLogf("success", "[OTA] Firmware image written (%u bytes); rebooting",
+              (unsigned)bytesWritten);
+      recordRestartIntent("ota-update");
+      otaRestartAtMs = millis() + 1500;
+    },
+    [](AsyncWebServerRequest *request, const String &filename, size_t index,
+       uint8_t *data, size_t len, bool final) {
+      OtaUploadContext *context = NULL;
+      auto existing = otaUploads.find(request);
+
+      if (index == 0) {
+        context = new OtaUploadContext();
+        if (!context) {
+          request->send(503, "application/json", "{\"error\":\"Not enough memory to start update\"}");
+          return;
+        }
+        otaUploads[request] = context;
+
+        if (!checkAdminAuth(request)) {
+          context->status = 401;
+          context->error = "Unauthorized";
+          return;
+        }
+        context->authorized = true;
+
+        String lowerName = filename;
+        lowerName.toLowerCase();
+        if (!lowerName.endsWith(".bin")) {
+          context->status = 400;
+          context->error = "Select a compiled .bin firmware image";
+          return;
+        }
+        if (otaUploadInProgress) {
+          context->status = 409;
+          context->error = "Another firmware update is already running";
+          return;
+        }
+        if (plexImportActiveSnapshot() || indexingInProgress || indexingTasksActive ||
+            requestIndexing || sdScanInProgress || activeStreams > 0) {
+          context->status = 409;
+          context->error = "Device is busy; stop imports, scans, indexing, and streams first";
+          return;
+        }
+        if (!armOtaBootGuard()) {
+          context->status = 500;
+          context->error = "Failed to arm rollback protection";
+          return;
+        }
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+          clearOtaBootGuard();
+          context->status = 500;
+          context->error = String("Failed to open inactive firmware partition: ") +
+                           String(Update.getError());
+          return;
+        }
+        otaUploadInProgress = true;
+        context->started = true;
+        webLogf("info", "[OTA] Receiving firmware image: %s", filename.c_str());
+      } else if (existing != otaUploads.end()) {
+        context = existing->second;
+      }
+
+      if (!context || !context->started || context->error.length()) return;
+
+      size_t written = Update.write(data, len);
+      context->bytesWritten += written;
+      if (written != len) {
+        context->status = 500;
+        context->error = String("Firmware write failed: ") + String(Update.getError());
+      }
+
+      if (final) {
+        if (!context->error.length() && Update.end(true)) {
+          context->success = true;
+          context->status = 200;
+        } else {
+          if (!context->error.length()) {
+            context->error = String("Firmware verification failed: ") + String(Update.getError());
+          }
+          context->status = 400;
+          Update.abort();
+        }
+      }
+    });
+
   server.on("/flash-mode", HTTP_POST, [](AsyncWebServerRequest *request){
       if (!checkAdminAuth(request)) { request->send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
       Serial.println(">>> /flash-mode handler hit");
@@ -7975,6 +8245,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
   }
 
   webLog("[SYSTEM] System initialization complete - ready for use", "success");
+  startOtaValidationTask();
   // re-print reset reason here since USB-CDC reconnects after the early print and misses it.
   // 4=PANIC 5=INT_WDT 6=TASK_WDT 9=BROWNOUT 3=SW
   {
@@ -8014,6 +8285,10 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
 // ==================== MAIN LOOP ====================
 
 void loop() {
+    if (otaRestartAtMs && (long)(millis() - otaRestartAtMs) >= 0) {
+      otaRestartAtMs = 0;
+      ESP.restart();
+    }
     if (bootButtonPressed) {
       bootButtonPressed = false;
       set_boot_mode(USB_MODE);

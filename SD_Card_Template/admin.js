@@ -250,6 +250,14 @@ function renderDeviceHealth(data) {
   setHealthText('health-restart-detail', restart.previousSnapshotValid
     ? `${restart.previousBuildId || 'unknown build'} | up ${formatHealthDuration(restart.previousUptimeMs)}`
     : `Current boot: ${restart.currentResetReasonName || 'unknown'}`);
+
+  const ota = data.ota || {};
+  setHealthText('ota-partition', ota.runningPartition
+    ? `${ota.runningPartition} active | ${ota.nextPartition || 'no target'} next`
+    : 'Partition status unavailable');
+  if (ota.validationPending) {
+    setHealthText('ota-status', `Validating firmware | boot attempt ${ota.bootAttempts || 1}`);
+  }
 }
 
 let healthPollActive = false;
@@ -271,6 +279,79 @@ async function fetchDeviceHealth() {
   } finally {
     healthPollActive = false;
   }
+}
+
+function setOtaProgress(percent, message) {
+  const safePercent = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const bar = document.getElementById('ota-progress-bar');
+  if (bar) bar.style.width = `${safePercent}%`;
+  setHealthText('ota-status', message);
+}
+
+function setupOtaUpdater() {
+  const form = document.getElementById('ota-form');
+  const input = document.getElementById('ota-file');
+  const submit = document.getElementById('ota-submit');
+  if (!form || !input || !submit) return;
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const file = input.files?.[0];
+    if (!file || !file.name.toLowerCase().endsWith('.bin')) {
+      setOtaProgress(0, 'Select a compiled .bin firmware image');
+      return;
+    }
+    if (!confirm(`Install ${file.name} and restart Nomad?`)) return;
+
+    const request = new XMLHttpRequest();
+    const body = new FormData();
+    body.append('firmware', file, file.name);
+    request.open('POST', '/api/firmware/update');
+    if (adminToken) request.setRequestHeader('X-Admin-Token', adminToken);
+    request.timeout = 10 * 60 * 1000;
+    submit.disabled = true;
+    input.disabled = true;
+    setOtaProgress(0, 'Uploading firmware');
+
+    request.upload.addEventListener('progress', (progress) => {
+      if (!progress.lengthComputable) return;
+      const percent = (progress.loaded / progress.total) * 100;
+      setOtaProgress(percent, `Uploading firmware | ${Math.round(percent)}%`);
+    });
+
+    request.addEventListener('load', () => {
+      let response = {};
+      try { response = JSON.parse(request.responseText || '{}'); } catch (_) {}
+      if (request.status >= 200 && request.status < 300) {
+        setOtaProgress(100, 'Firmware accepted | device restarting');
+        addConsoleLog('OTA firmware accepted. Device is restarting.', 'success');
+        setTimeout(fetchDeviceHealth, 15000);
+        return;
+      }
+      if (request.status === 401) {
+        setAdminToken('');
+        const overlay = document.getElementById('auth-overlay');
+        if (overlay) overlay.classList.remove('hidden');
+      }
+      setOtaProgress(0, response.error || `Firmware update failed | HTTP ${request.status}`);
+      submit.disabled = false;
+      input.disabled = false;
+    });
+
+    request.addEventListener('error', () => {
+      setOtaProgress(0, 'Firmware upload connection failed');
+      submit.disabled = false;
+      input.disabled = false;
+    });
+
+    request.addEventListener('timeout', () => {
+      setOtaProgress(0, 'Firmware upload timed out');
+      submit.disabled = false;
+      input.disabled = false;
+    });
+
+    request.send(body);
+  });
 }
 
 // full-card walk. the exact "how full is my card" answer - slow (10-20 min), also
@@ -1245,6 +1326,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Load settings and authenticate
   await loadSettings();
   setupLazyFrames();
+  setupOtaUpdater();
   
   // initial data (refreshConsole is kicked off by the adaptive poll loop below)
   fetchSD();

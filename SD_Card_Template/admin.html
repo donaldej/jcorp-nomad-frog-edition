@@ -3,7 +3,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="nomad-ui-build-id" content="ui-20260809-002">
+  <meta name="nomad-ui-build-id" content="ui-20260809-003">
   <link rel="stylesheet" href="/master.css">
   <script src="/theme-boot.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -562,6 +562,22 @@
       overflow-wrap: anywhere;
     }
 
+    .ota-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 1rem;
+      align-items: end;
+    }
+
+    .ota-status-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-top: 0.75rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
     @media (max-width: 768px) {
       .home-wifi-layout,
       .home-wifi-status {
@@ -570,6 +586,10 @@
 
       .health-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .ota-layout {
+        grid-template-columns: 1fr;
       }
     }
 
@@ -1049,6 +1069,27 @@
             <div id="health-restart" class="health-metric-value">-</div>
             <div id="health-restart-detail" class="health-metric-detail">-</div>
           </div>
+        </div>
+      </div>
+
+      <!-- Firmware Update -->
+      <div class="card ota-section">
+        <h2>Firmware Update</h2>
+        <form id="ota-form">
+          <div class="ota-layout">
+            <div class="form-group" style="margin: 0;">
+              <label class="form-label" for="ota-file">Compiled firmware image</label>
+              <input id="ota-file" class="form-control" type="file" accept=".bin,application/octet-stream">
+            </div>
+            <button id="ota-submit" class="btn btn-primary" type="submit">Install Firmware</button>
+          </div>
+        </form>
+        <div class="progress" style="margin-top: 1rem;">
+          <div id="ota-progress-bar" class="progress-bar" style="width: 0%"></div>
+        </div>
+        <div class="ota-status-row">
+          <span id="ota-status">Ready</span>
+          <span id="ota-partition">Partition status loading</span>
         </div>
       </div>
 

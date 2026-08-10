@@ -467,6 +467,41 @@ struct PlexProxyContext {
   ~PlexProxyContext() { http.end(); }
 };
 
+struct PsramResponseBuffer {
+  uint8_t *data = nullptr;
+  size_t capacity = 0;
+  size_t length = 0;
+  bool overflow = false;
+
+  explicit PsramResponseBuffer(size_t requestedCapacity) : capacity(requestedCapacity) {
+    data = static_cast<uint8_t*>(
+      heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  }
+  ~PsramResponseBuffer() {
+    if (data) heap_caps_free(data);
+  }
+};
+
+class PsramBufferPrint : public Print {
+ public:
+  explicit PsramBufferPrint(PsramResponseBuffer &buffer) : buffer_(buffer) {}
+  size_t write(uint8_t value) override {
+    return write(&value, 1);
+  }
+  size_t write(const uint8_t *source, size_t size) override {
+    if (!buffer_.data || buffer_.length + size > buffer_.capacity) {
+      buffer_.overflow = true;
+      return 0;
+    }
+    memcpy(buffer_.data + buffer_.length, source, size);
+    buffer_.length += size;
+    return size;
+  }
+
+ private:
+  PsramResponseBuffer &buffer_;
+};
+
 PlexImportState plexImportState;
 std::vector<PlexImportJob*> plexImportJobs;
 uint32_t plexImportNextId = 1;
@@ -486,6 +521,9 @@ void plexPipelineWriterTask(void *pvParameters);
 bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
                              uint64_t resumeOffset, uint64_t total, String &message,
                              uint64_t &downloaded);
+void printJsonEscapedTo(Print &out, const String &value);
+bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
+                       const std::shared_ptr<PsramResponseBuffer> &body);
 volatile unsigned long httpDebugPingCount = 0;
 volatile unsigned long httpDebugStatusCount = 0;
 volatile unsigned long httpLastDebugPingMs = 0;
@@ -699,6 +737,40 @@ String jsonEscape(const String &in){
     else out += c;
   }
   return out;
+}
+
+void printJsonEscapedTo(Print &out, const String &value) {
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value.charAt(i);
+    if (c == '\\' || c == '"') {
+      out.write('\\');
+      out.write(c);
+    } else if (c == '\n') {
+      out.print(F("\\n"));
+    } else if (c == '\r') {
+      out.print(F("\\r"));
+    } else if ((uint8_t)c < 0x20) {
+      out.write(' ');
+    } else {
+      out.write(c);
+    }
+  }
+}
+
+bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
+                       const std::shared_ptr<PsramResponseBuffer> &body) {
+  if (!body || !body->data || body->overflow) return false;
+  AwsResponseFiller filler = [body](uint8_t *destination, size_t maxLen, size_t index) -> size_t {
+    if (index >= body->length) return 0;
+    size_t count = min(maxLen, body->length - index);
+    memcpy(destination, body->data + index, count);
+    return count;
+  };
+  AsyncWebServerResponse *response = request->beginResponse(contentType, body->length, filler);
+  if (!response) return false;
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+  return true;
 }
 
 String htmlEscape(const String &in) {
@@ -6277,9 +6349,16 @@ server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
   doc["flipScreen"] = settings.flipScreen;
 
 
-  String json;
-  serializeJson(doc, json);
-  request->send(200, "application/json", json);
+  std::shared_ptr<PsramResponseBuffer> body = std::make_shared<PsramResponseBuffer>(8192);
+  if (!body || !body->data) {
+    request->send(503, "application/json", "{\"error\":\"Not enough PSRAM for settings response\"}");
+    return;
+  }
+  PsramBufferPrint output(*body);
+  serializeJson(doc, output);
+  if (!sendPsramResponse(request, "application/json", body)) {
+    request->send(503, "application/json", "{\"error\":\"Settings response too large\"}");
+  }
 });
 
 
@@ -6385,54 +6464,70 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
     return;
   }
   bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
-  AsyncResponseStream *stream = request->beginResponseStream("application/json");
-  stream->print("{\"active\":");
-  stream->print(plexImportState.active ? "true" : "false");
-  stream->print(",\"workerRunning\":");
-  stream->print(plexImportWorkerRunning ? "true" : "false");
-  stream->print(",\"success\":");
-  stream->print(plexImportState.success ? "true" : "false");
-  stream->printf(",\"downloaded\":%llu", (unsigned long long)plexImportState.downloaded);
-  stream->printf(",\"total\":%llu", (unsigned long long)plexImportState.total);
-  stream->printf(",\"startedMs\":%lu", plexImportState.startedMs);
-  stream->printf(",\"updatedMs\":%lu", plexImportState.updatedMs);
-  stream->print(",\"label\":\"" + jsonEscape(plexImportState.label) + "\"");
-  stream->print(",\"destPath\":\"" + jsonEscape(plexImportState.destPath) + "\"");
-  stream->print(",\"message\":\"" + jsonEscape(plexImportState.message) + "\"");
-  stream->printf(",\"queued\":%u,\"jobs\":[", (unsigned)plexQueuedCountLocked());
+  std::shared_ptr<PsramResponseBuffer> body = std::make_shared<PsramResponseBuffer>(32768);
+  if (!body || !body->data) {
+    if (locked) xSemaphoreGive(plexImportMutex);
+    request->send(503, "application/json", "{\"error\":\"Not enough PSRAM for queue status\"}");
+    return;
+  }
+  PsramBufferPrint stream(*body);
+  stream.print("{\"active\":");
+  stream.print(plexImportState.active ? "true" : "false");
+  stream.print(",\"workerRunning\":");
+  stream.print(plexImportWorkerRunning ? "true" : "false");
+  stream.print(",\"success\":");
+  stream.print(plexImportState.success ? "true" : "false");
+  stream.printf(",\"downloaded\":%llu", (unsigned long long)plexImportState.downloaded);
+  stream.printf(",\"total\":%llu", (unsigned long long)plexImportState.total);
+  stream.printf(",\"startedMs\":%lu", plexImportState.startedMs);
+  stream.printf(",\"updatedMs\":%lu", plexImportState.updatedMs);
+  stream.print(",\"label\":\"");
+  printJsonEscapedTo(stream, plexImportState.label);
+  stream.print("\",\"destPath\":\"");
+  printJsonEscapedTo(stream, plexImportState.destPath);
+  stream.print("\",\"message\":\"");
+  printJsonEscapedTo(stream, plexImportState.message);
+  stream.printf("\",\"queued\":%u,\"jobs\":[", (unsigned)plexQueuedCountLocked());
   bool first = true;
   for (PlexImportJob *job : plexImportJobs) {
     if (!job) continue;
-    if (!first) stream->print(',');
+    if (!first) stream.print(',');
     first = false;
-    stream->printf("{\"id\":%u", (unsigned)job->id);
-    stream->print(",\"status\":\"" + jsonEscape(job->status) + "\"");
-    stream->print(",\"success\":");
-    stream->print(job->success ? "true" : "false");
-    stream->printf(",\"downloaded\":%llu", (unsigned long long)job->downloaded);
-    stream->printf(",\"total\":%llu", (unsigned long long)job->total);
-    stream->printf(",\"transferBytes\":%llu", (unsigned long long)job->transferBytes);
-    stream->printf(",\"transferElapsedMs\":%u", (unsigned)job->transferElapsedMs);
-    stream->printf(",\"networkActiveMs\":%u", (unsigned)job->networkActiveMs);
-    stream->printf(",\"sdWriteMs\":%u", (unsigned)job->sdWriteMs);
-    stream->printf(",\"pipelineWaitMs\":%u", (unsigned)job->pipelineWaitMs);
-    stream->printf(",\"pipelineBufferSize\":%u", (unsigned)job->pipelineBufferSize);
+    stream.printf("{\"id\":%u", (unsigned)job->id);
+    stream.print(",\"status\":\"");
+    printJsonEscapedTo(stream, job->status);
+    stream.print("\",\"success\":");
+    stream.print(job->success ? "true" : "false");
+    stream.printf(",\"downloaded\":%llu", (unsigned long long)job->downloaded);
+    stream.printf(",\"total\":%llu", (unsigned long long)job->total);
+    stream.printf(",\"transferBytes\":%llu", (unsigned long long)job->transferBytes);
+    stream.printf(",\"transferElapsedMs\":%u", (unsigned)job->transferElapsedMs);
+    stream.printf(",\"networkActiveMs\":%u", (unsigned)job->networkActiveMs);
+    stream.printf(",\"sdWriteMs\":%u", (unsigned)job->sdWriteMs);
+    stream.printf(",\"pipelineWaitMs\":%u", (unsigned)job->pipelineWaitMs);
+    stream.printf(",\"pipelineBufferSize\":%u", (unsigned)job->pipelineBufferSize);
     float overallMiBps = job->transferElapsedMs > 0
       ? ((float)job->transferBytes * 1000.0f / (float)job->transferElapsedMs) / 1048576.0f : 0.0f;
     float networkMiBps = job->networkActiveMs > 0
       ? ((float)job->transferBytes * 1000.0f / (float)job->networkActiveMs) / 1048576.0f : 0.0f;
     float sdMiBps = job->sdWriteMs > 0
       ? ((float)job->transferBytes * 1000.0f / (float)job->sdWriteMs) / 1048576.0f : 0.0f;
-    stream->printf(",\"overallMiBps\":%.3f", overallMiBps);
-    stream->printf(",\"networkMiBps\":%.3f", networkMiBps);
-    stream->printf(",\"sdMiBps\":%.3f", sdMiBps);
-    stream->print(",\"label\":\"" + jsonEscape(job->label) + "\"");
-    stream->print(",\"destPath\":\"" + jsonEscape(job->destPath) + "\"");
-    stream->print(",\"message\":\"" + jsonEscape(job->message) + "\"}");
+    stream.printf(",\"overallMiBps\":%.3f", overallMiBps);
+    stream.printf(",\"networkMiBps\":%.3f", networkMiBps);
+    stream.printf(",\"sdMiBps\":%.3f", sdMiBps);
+    stream.print(",\"label\":\"");
+    printJsonEscapedTo(stream, job->label);
+    stream.print("\",\"destPath\":\"");
+    printJsonEscapedTo(stream, job->destPath);
+    stream.print("\",\"message\":\"");
+    printJsonEscapedTo(stream, job->message);
+    stream.print("\"}");
   }
-  stream->print("]}");
+  stream.print("]}");
   if (locked) xSemaphoreGive(plexImportMutex);
-  request->send(stream);
+  if (!sendPsramResponse(request, "application/json", body)) {
+    request->send(503, "application/json", "{\"error\":\"Queue status response too large\"}");
+  }
 });
 
 server.on("/api/debug/ping", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -6571,9 +6666,16 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   plex["averageBytesPerSec"] = importAverageBytesPerSec;
   plex["averageMiBPerSec"] = importAverageBytesPerSec / 1048576.0f;
 
-  String json;
-  serializeJson(doc, json);
-  request->send(200, "application/json", json);
+  std::shared_ptr<PsramResponseBuffer> body = std::make_shared<PsramResponseBuffer>(8192);
+  if (!body || !body->data) {
+    request->send(503, "application/json", "{\"error\":\"Not enough PSRAM for debug status\"}");
+    return;
+  }
+  PsramBufferPrint output(*body);
+  serializeJson(doc, output);
+  if (!sendPsramResponse(request, "application/json", body)) {
+    request->send(503, "application/json", "{\"error\":\"Debug status response too large\"}");
+  }
 });
 
 server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){

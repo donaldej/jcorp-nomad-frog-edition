@@ -171,6 +171,13 @@
       color: var(--text);
     }
     .mode-toggle input { width: auto; }
+    .sync-status {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-top: 0.75rem;
+    }
     @media (max-width: 820px) {
       .grid { grid-template-columns: 1fr; }
       .header { align-items: flex-start; flex-direction: column; gap: 0.75rem; }
@@ -200,6 +207,56 @@
         </div>
       </div>
       <div id="auth-message" class="muted" style="margin-top:0.75rem;"></div>
+    </section>
+
+    <section class="card">
+      <h2>Automatic Plex Sync</h2>
+      <div class="grid">
+        <div class="form-group">
+          <label for="sync-source-type">Source Type</label>
+          <select id="sync-source-type">
+            <option value="playlist">Video Playlist</option>
+            <option value="collection">Collection</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="sync-library">Collection Library</label>
+          <select id="sync-library"></select>
+        </div>
+        <div class="form-group">
+          <label for="sync-source-key">Source Rating Key</label>
+          <input id="sync-source-key" type="text" inputmode="numeric" placeholder="Plex rating key">
+        </div>
+        <div class="form-group">
+          <label for="sync-source-select">Discovered Sources</label>
+          <select id="sync-source-select"><option value="">None loaded</option></select>
+        </div>
+        <div class="form-group">
+          <label for="sync-dest-dir">Nomad Destination</label>
+          <input id="sync-dest-dir" type="text" placeholder="/Movies/Plex Sync">
+        </div>
+        <div class="form-group">
+          <label for="sync-interval">Check Interval (hours)</label>
+          <input id="sync-interval" type="number" min="1" max="168" step="1">
+        </div>
+        <div class="form-group">
+          <label for="sync-min-free">Minimum Free Space (GB)</label>
+          <input id="sync-min-free" type="number" min="1" max="1000" step="1">
+        </div>
+        <div class="form-group" style="justify-content:end;">
+          <label class="mode-toggle"><input id="sync-enabled" type="checkbox"> Scheduled Sync</label>
+          <label class="mode-toggle"><input id="sync-prune" type="checkbox"> Prune Managed Files</label>
+        </div>
+      </div>
+      <div class="toolbar" style="margin-top:1rem;">
+        <button id="sync-save" class="btn btn-primary">Save Sync Settings</button>
+        <button id="sync-load-sources" class="btn">Load Sources</button>
+        <button id="sync-run" class="btn btn-success">Run Sync</button>
+      </div>
+      <div class="sync-status muted">
+        <span id="sync-message">Not run</span>
+        <span id="sync-managed">0 managed files</span>
+      </div>
     </section>
 
     <section class="card">
@@ -284,6 +341,20 @@
       plexUrl: document.getElementById('plex-url'),
       plexToken: document.getElementById('plex-token'),
       bulkTransferMode: document.getElementById('bulk-transfer-mode'),
+      syncSourceType: document.getElementById('sync-source-type'),
+      syncLibrary: document.getElementById('sync-library'),
+      syncSourceKey: document.getElementById('sync-source-key'),
+      syncSourceSelect: document.getElementById('sync-source-select'),
+      syncDestDir: document.getElementById('sync-dest-dir'),
+      syncInterval: document.getElementById('sync-interval'),
+      syncMinFree: document.getElementById('sync-min-free'),
+      syncEnabled: document.getElementById('sync-enabled'),
+      syncPrune: document.getElementById('sync-prune'),
+      syncSave: document.getElementById('sync-save'),
+      syncLoadSources: document.getElementById('sync-load-sources'),
+      syncRun: document.getElementById('sync-run'),
+      syncMessage: document.getElementById('sync-message'),
+      syncManaged: document.getElementById('sync-managed'),
       saveSettings: document.getElementById('save-settings'),
       loadLibraries: document.getElementById('load-libraries'),
       connectionMessage: document.getElementById('connection-message'),
@@ -448,6 +519,15 @@
         els.plexUrl.value = settings.plexUrl || '';
         els.plexToken.value = settings.plexToken || '';
         els.bulkTransferMode.checked = Boolean(settings.bulkTransferMode);
+        els.syncEnabled.checked = Boolean(settings.plexSyncEnabled);
+        els.syncSourceType.value = settings.plexSyncSourceType || 'playlist';
+        els.syncSourceKey.value = settings.plexSyncSourceKey || '';
+        els.syncDestDir.value = settings.plexSyncDestDir || '/Movies/Plex Sync';
+        els.syncInterval.value = settings.plexSyncIntervalHours || 24;
+        els.syncMinFree.value = settings.plexSyncMinFreeGB || 10;
+        els.syncPrune.checked = Boolean(settings.plexSyncPruneManaged);
+        els.syncLibrary.dataset.configured = settings.plexSyncLibraryKey || '';
+        updateSyncSourceControls();
       } catch (e) {
         els.connectionMessage.textContent = e.message;
       }
@@ -457,7 +537,15 @@
       const body = {
         plexUrl: els.plexUrl.value.trim(),
         plexToken: els.plexToken.value.trim(),
-        bulkTransferMode: els.bulkTransferMode.checked
+        bulkTransferMode: els.bulkTransferMode.checked,
+        plexSyncEnabled: els.syncEnabled.checked,
+        plexSyncSourceType: els.syncSourceType.value,
+        plexSyncSourceKey: els.syncSourceKey.value.trim(),
+        plexSyncLibraryKey: els.syncLibrary.value || els.syncLibrary.dataset.configured || '',
+        plexSyncDestDir: els.syncDestDir.value.trim(),
+        plexSyncIntervalHours: Number(els.syncInterval.value) || 24,
+        plexSyncMinFreeGB: Number(els.syncMinFree.value) || 10,
+        plexSyncPruneManaged: els.syncPrune.checked
       };
       await api('/settings', {
         method: 'POST',
@@ -493,14 +581,67 @@
       const mc = mediaContainer(data);
       libraries = asArray(mc.Directory).filter(l => l.type === 'movie' || l.type === 'show');
       els.librarySelect.innerHTML = '';
+      els.syncLibrary.innerHTML = '';
       for (const lib of libraries) {
         const opt = document.createElement('option');
         opt.value = lib.key;
         opt.textContent = `${lib.title} (${lib.type})`;
         opt.dataset.type = lib.type;
         els.librarySelect.appendChild(opt);
+
+        const syncOpt = document.createElement('option');
+        syncOpt.value = lib.key;
+        syncOpt.textContent = `${lib.title} (${lib.type})`;
+        els.syncLibrary.appendChild(syncOpt);
       }
+      const configuredLibrary = els.syncLibrary.dataset.configured;
+      if (configuredLibrary) els.syncLibrary.value = configuredLibrary;
       els.connectionMessage.textContent = libraries.length ? 'Libraries loaded.' : 'No movie/show libraries found.';
+    }
+
+    function updateSyncSourceControls() {
+      const collection = els.syncSourceType.value === 'collection';
+      els.syncLibrary.disabled = !collection;
+    }
+
+    async function loadSyncSources() {
+      els.syncMessage.textContent = 'Loading sync sources...';
+      let endpoint = '/api/plex/playlists';
+      if (els.syncSourceType.value === 'collection') {
+        const libraryKey = els.syncLibrary.value || els.syncLibrary.dataset.configured;
+        if (!libraryKey) {
+          els.syncMessage.textContent = 'Select a collection library.';
+          return;
+        }
+        endpoint = `/api/plex/collections?libraryKey=${encodeURIComponent(libraryKey)}`;
+      }
+      const data = await api(endpoint, { cache: 'no-store' });
+      const sources = asArray(mediaContainer(data).Metadata);
+      els.syncSourceSelect.innerHTML = '<option value="">Select a source</option>';
+      for (const source of sources) {
+        const option = document.createElement('option');
+        option.value = source.ratingKey;
+        option.textContent = source.title || `Plex source ${source.ratingKey}`;
+        els.syncSourceSelect.appendChild(option);
+      }
+      els.syncMessage.textContent = sources.length ? `${sources.length} sources loaded.` : 'No matching Plex sources found.';
+    }
+
+    async function pollSyncStatus() {
+      try {
+        const status = await api('/api/plex/sync-status', { cache: 'no-store' });
+        els.syncMessage.textContent = status.running ? 'Sync running...' : (status.message || 'Not run');
+        const managedGB = (Number(status.managedBytes || 0) / 1073741824).toFixed(2);
+        els.syncManaged.textContent = `${status.managedCount || 0} managed files | ${managedGB} GB`;
+        els.syncRun.disabled = Boolean(status.running);
+      } catch (_) {}
+    }
+
+    async function runSync() {
+      await saveSettings();
+      await api('/api/plex/sync', { method: 'POST' });
+      els.syncMessage.textContent = 'Sync started.';
+      setTimeout(pollSyncStatus, 1000);
     }
 
     async function loadItems() {
@@ -633,10 +774,19 @@
     els.filter.addEventListener('input', renderItems);
     els.startImport.addEventListener('click', () => startImport().catch(e => { els.progressMessage.textContent = e.message; }));
     els.clearHistory.addEventListener('click', () => queueAction('clear').catch(e => { els.progressMessage.textContent = e.message; }));
+    els.syncSourceType.addEventListener('change', updateSyncSourceControls);
+    els.syncSourceSelect.addEventListener('change', () => {
+      if (els.syncSourceSelect.value) els.syncSourceKey.value = els.syncSourceSelect.value;
+    });
+    els.syncSave.addEventListener('click', () => saveSettings().catch(e => { els.syncMessage.textContent = e.message; }));
+    els.syncLoadSources.addEventListener('click', () => loadSyncSources().catch(e => { els.syncMessage.textContent = e.message; }));
+    els.syncRun.addEventListener('click', () => runSync().catch(e => { els.syncMessage.textContent = e.message; }));
 
     if (typeof ThemeManager !== 'undefined') ThemeManager.init();
     loadSettings();
     startPolling();
+    pollSyncStatus();
+    setInterval(pollSyncStatus, 10000);
   </script>
 </body>
 </html>

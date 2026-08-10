@@ -359,6 +359,8 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #define PLEX_QUEUE_PERSIST_INTERVAL_MS 5000UL
 #define PLEX_QUEUE_MAX_JOBS 16
+#define PLEX_SYNC_MANIFEST_PATH "/.system-index/plex_sync_manifest.ndjson"
+#define PLEX_SYNC_MANIFEST_TEMP_PATH "/.system-index/plex_sync_manifest.tmp"
 #define HTTP_HEALTH_LOG_INTERVAL_MS 30000UL
 #define HTTP_HEALTH_SAMPLE_INTERVAL_MS 5000UL
 #define HEALTH_LOW_HEAP_WARN_BYTES 25000UL
@@ -386,6 +388,14 @@ struct AdminSettings {
   String plexUrl = "";
   String plexToken = "";
   bool bulkTransferMode = false;
+  bool plexSyncEnabled = false;
+  String plexSyncSourceType = "playlist";
+  String plexSyncSourceKey = "";
+  String plexSyncLibraryKey = "";
+  String plexSyncDestDir = "/Movies/Plex Sync";
+  uint16_t plexSyncIntervalHours = 24;
+  uint16_t plexSyncMinFreeGB = 10;
+  bool plexSyncPruneManaged = false;
   int brightness = 100;            // percent 0-100 (Set_Backlight range); 230 was out-of-range and ignored
   bool autoGenerateMedia = true;   // check for new files on boot (default on)
   bool flipScreen = false;         // rotate LCD 180 deg (USB port upside down, e.g. car mounts)
@@ -450,8 +460,12 @@ struct PlexImportJob {
   uint32_t pipelineWaitMs = 0;
   uint32_t pipelineBufferSize = 0;
   bool success = false;
+  bool managedSync = false;
+  String syncRatingKey;
   volatile bool cancelRequested = false;
 };
+
+bool appendPlexSyncManifest(const PlexImportJob *job, uint64_t size);
 
 struct PlexTransferPipeline {
   File *out = nullptr;
@@ -484,6 +498,19 @@ struct PsramResponseBuffer {
   }
   ~PsramResponseBuffer() {
     if (data) heap_caps_free(data);
+  }
+};
+
+struct PsramJsonAllocator {
+  void *allocate(size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  void deallocate(void *pointer) {
+    heap_caps_free(pointer);
+  }
+  void *reallocate(void *pointer, size_t newSize) {
+    return heap_caps_realloc(pointer, newSize,
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   }
 };
 
@@ -564,6 +591,8 @@ void initRestartDiagnostics();
 void updateRestartSnapshot(const char *operation);
 void recordRestartIntent(const char *intent);
 bool plexImportActiveSnapshot();
+bool startPlexSyncTask(bool manualRun = false);
+void plexSyncSchedulerTask(void *pvParameters);
 void initOtaBootGuard();
 void startOtaValidationTask();
 volatile unsigned long httpDebugPingCount = 0;
@@ -581,6 +610,14 @@ volatile unsigned long healthLastCriticalHeapMs = 0;
 volatile size_t healthLastFreeHeap = 0;
 volatile size_t healthLastMinFreeHeap = 0;
 volatile size_t healthLastMaxAllocHeap = 0;
+volatile bool plexSyncTaskRunning = false;
+volatile bool plexSyncManualRequested = false;
+volatile unsigned long plexSyncLastRunMs = 0;
+volatile uint32_t plexSyncLastQueued = 0;
+volatile uint32_t plexSyncManagedCount = 0;
+volatile uint64_t plexSyncManagedBytes = 0;
+char plexSyncLastMessage[96] = "Not run";
+portMUX_TYPE plexSyncStatusMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool otaUploadInProgress = false;
 volatile bool otaValidationPending = false;
 volatile unsigned long otaRestartAtMs = 0;
@@ -1806,6 +1843,14 @@ bool loadSettings() {
   settings.plexUrl = doc["plexUrl"] | "";
   settings.plexToken = doc["plexToken"] | "";
   settings.bulkTransferMode = doc["bulkTransferMode"] | false;
+  settings.plexSyncEnabled = doc["plexSyncEnabled"] | false;
+  settings.plexSyncSourceType = doc["plexSyncSourceType"] | "playlist";
+  settings.plexSyncSourceKey = doc["plexSyncSourceKey"] | "";
+  settings.plexSyncLibraryKey = doc["plexSyncLibraryKey"] | "";
+  settings.plexSyncDestDir = doc["plexSyncDestDir"] | "/Movies/Plex Sync";
+  settings.plexSyncIntervalHours = constrain(doc["plexSyncIntervalHours"] | 24, 1, 168);
+  settings.plexSyncMinFreeGB = constrain(doc["plexSyncMinFreeGB"] | 10, 1, 1000);
+  settings.plexSyncPruneManaged = doc["plexSyncPruneManaged"] | false;
   settings.brightness = doc["brightness"] | 100;
   // brightness is 0-100 (Set_Backlight ignores >100). old builds defaulted to 230, clamp it
   settings.brightness = constrain(settings.brightness, 0, 100);
@@ -1846,6 +1891,14 @@ bool saveSettings() {
   doc["plexUrl"] = settings.plexUrl;
   doc["plexToken"] = settings.plexToken;
   doc["bulkTransferMode"] = settings.bulkTransferMode;
+  doc["plexSyncEnabled"] = settings.plexSyncEnabled;
+  doc["plexSyncSourceType"] = settings.plexSyncSourceType;
+  doc["plexSyncSourceKey"] = settings.plexSyncSourceKey;
+  doc["plexSyncLibraryKey"] = settings.plexSyncLibraryKey;
+  doc["plexSyncDestDir"] = settings.plexSyncDestDir;
+  doc["plexSyncIntervalHours"] = settings.plexSyncIntervalHours;
+  doc["plexSyncMinFreeGB"] = settings.plexSyncMinFreeGB;
+  doc["plexSyncPruneManaged"] = settings.plexSyncPruneManaged;
   doc["brightness"] = settings.brightness;
   doc["autoGenerateMedia"] = settings.autoGenerateMedia;
   doc["flipScreen"] = settings.flipScreen;
@@ -4246,6 +4299,8 @@ bool persistPlexImportQueue() {
       doc["pipelineWaitMs"] = job->pipelineWaitMs;
       doc["pipelineBufferSize"] = job->pipelineBufferSize;
       doc["success"] = job->success;
+      doc["managedSync"] = job->managedSync;
+      doc["syncRatingKey"] = job->syncRatingKey;
       if (serializeJson(doc, out) == 0 || out.print('\n') == 0) {
         ok = false;
         break;
@@ -4302,6 +4357,8 @@ void loadPlexImportQueue() {
     job->pipelineWaitMs = doc["pipelineWaitMs"] | 0UL;
     job->pipelineBufferSize = doc["pipelineBufferSize"] | 0UL;
     job->success = doc["success"] | false;
+    job->managedSync = doc["managedSync"] | false;
+    job->syncRatingKey = doc["syncRatingKey"] | "";
     job->cancelRequested = false;
     if (job->status == "running" || job->status == "waiting") {
       job->status = "queued";
@@ -4313,6 +4370,358 @@ void loadPlexImportQueue() {
   in.close();
   if (sdMutex) xSemaphoreGive(sdMutex);
   webLogf("info", "[Plex] Restored %u queued/history jobs", (unsigned)plexImportJobs.size());
+}
+
+void setPlexSyncStatus(const char *message, uint32_t queued = 0) {
+  portENTER_CRITICAL(&plexSyncStatusMux);
+  strlcpy(plexSyncLastMessage, message ? message : "", sizeof(plexSyncLastMessage));
+  plexSyncLastQueued = queued;
+  portEXIT_CRITICAL(&plexSyncStatusMux);
+}
+
+String plexSyncSafeName(const String &input) {
+  String output;
+  output.reserve(min((size_t)80, input.length()));
+  for (size_t i = 0; i < input.length() && output.length() < 80; i++) {
+    char c = input.charAt(i);
+    bool invalid = (uint8_t)c < 32 || c == '<' || c == '>' || c == ':' ||
+                   c == '"' || c == '/' || c == '\\' || c == '|' ||
+                   c == '?' || c == '*';
+    output += invalid ? ' ' : c;
+  }
+  output.trim();
+  while (output.endsWith(".")) output.remove(output.length() - 1);
+  return output.length() ? output : "Plex Item";
+}
+
+bool plexSyncManifestContains(const String &ratingKey) {
+  bool locked = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;
+  if (!locked) return false;
+  File file = SD_MMC.open(PLEX_SYNC_MANIFEST_PATH, FILE_READ);
+  bool found = false;
+  while (file && file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.indexOf(String("\"ratingKey\":\"") + ratingKey + "\"") >= 0) {
+      found = true;
+      break;
+    }
+  }
+  if (file) file.close();
+  if (sdMutex) xSemaphoreGive(sdMutex);
+  return found;
+}
+
+bool plexSyncQueueContains(const String &ratingKey) {
+  bool locked = plexImportMutex &&
+                xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+  if (plexImportMutex && !locked) return true;
+  bool found = false;
+  for (PlexImportJob *job : plexImportJobs) {
+    if (job && job->managedSync && job->syncRatingKey == ratingKey &&
+        job->status != "failed" && job->status != "cancelled") {
+      found = true;
+      break;
+    }
+  }
+  if (locked) xSemaphoreGive(plexImportMutex);
+  return found;
+}
+
+void refreshPlexSyncManagedStats() {
+  uint32_t count = 0;
+  uint64_t bytes = 0;
+  bool locked = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;
+  if (locked) {
+    File file = SD_MMC.open(PLEX_SYNC_MANIFEST_PATH, FILE_READ);
+    while (file && file.available()) {
+      String line = file.readStringUntil('\n');
+      StaticJsonDocument<512> entry;
+      if (!deserializeJson(entry, line)) {
+        count++;
+        bytes += entry["size"] | 0ULL;
+      }
+    }
+    if (file) file.close();
+    if (sdMutex) xSemaphoreGive(sdMutex);
+  }
+  plexSyncManagedCount = count;
+  plexSyncManagedBytes = bytes;
+}
+
+bool appendPlexSyncManifest(const PlexImportJob *job, uint64_t size) {
+  if (!job || !job->managedSync || !job->syncRatingKey.length()) return false;
+  bool locked = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;
+  if (!locked) return false;
+  if (!SD_MMC.exists(INDEX_DIR)) SD_MMC.mkdir(INDEX_DIR);
+  File file = SD_MMC.open(PLEX_SYNC_MANIFEST_PATH, FILE_APPEND);
+  bool ok = false;
+  if (file) {
+    file.print("{\"ratingKey\":\"");
+    printJsonEscapedTo(file, job->syncRatingKey);
+    file.print("\",\"path\":\"");
+    printJsonEscapedTo(file, job->destPath);
+    file.print("\",\"size\":");
+    file.print((unsigned long long)size);
+    file.print(",\"added\":");
+    file.print((unsigned long long)time(NULL));
+    file.println("}");
+    file.flush();
+    ok = true;
+    file.close();
+  }
+  if (sdMutex) xSemaphoreGive(sdMutex);
+  if (ok) refreshPlexSyncManagedStats();
+  return ok;
+}
+
+bool evictOldestPlexSyncFile() {
+  bool locked = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+  if (!locked || !SD_MMC.exists(PLEX_SYNC_MANIFEST_PATH)) {
+    if (locked && sdMutex) xSemaphoreGive(sdMutex);
+    return false;
+  }
+
+  File input = SD_MMC.open(PLEX_SYNC_MANIFEST_PATH, FILE_READ);
+  String selectedPath;
+  uint64_t selectedSize = 0;
+  while (input && input.available() && !selectedPath.length()) {
+    String line = input.readStringUntil('\n');
+    StaticJsonDocument<512> entry;
+    if (!deserializeJson(entry, line)) {
+      selectedPath = entry["path"] | "";
+      selectedSize = entry["size"] | 0ULL;
+    }
+  }
+  if (input) input.close();
+
+  String normalizedRoot = normalizePath(settings.plexSyncDestDir);
+  String checkedPath = selectedPath;
+  String pathError;
+  bool ownedPath = selectedPath.length() &&
+                   validateUserPath(checkedPath, false, pathError) &&
+                   checkedPath.startsWith(normalizedRoot + "/");
+  bool removed = false;
+  if (ownedPath && SD_MMC.exists(checkedPath)) {
+    File managed = SD_MMC.open(checkedPath, FILE_READ);
+    uint64_t actualSize = managed ? managed.size() : 0;
+    if (managed) managed.close();
+    if (actualSize == selectedSize) removed = SD_MMC.remove(checkedPath);
+  }
+
+  if (SD_MMC.exists(PLEX_SYNC_MANIFEST_TEMP_PATH)) {
+    SD_MMC.remove(PLEX_SYNC_MANIFEST_TEMP_PATH);
+  }
+  input = SD_MMC.open(PLEX_SYNC_MANIFEST_PATH, FILE_READ);
+  File output = SD_MMC.open(PLEX_SYNC_MANIFEST_TEMP_PATH, FILE_WRITE);
+  bool rewriteOk = (bool)input && (bool)output;
+  while (rewriteOk && input.available()) {
+    String line = input.readStringUntil('\n');
+    StaticJsonDocument<512> entry;
+    String path;
+    if (!deserializeJson(entry, line)) path = entry["path"] | "";
+    if (path != selectedPath) {
+      rewriteOk = output.println(line) > 0;
+    }
+  }
+  if (input) input.close();
+  if (output) {
+    output.flush();
+    output.close();
+  }
+  if (rewriteOk) {
+    SD_MMC.remove(PLEX_SYNC_MANIFEST_PATH);
+    rewriteOk = SD_MMC.rename(PLEX_SYNC_MANIFEST_TEMP_PATH, PLEX_SYNC_MANIFEST_PATH);
+  }
+  if (!rewriteOk && SD_MMC.exists(PLEX_SYNC_MANIFEST_TEMP_PATH)) {
+    SD_MMC.remove(PLEX_SYNC_MANIFEST_TEMP_PATH);
+  }
+  if (sdMutex) xSemaphoreGive(sdMutex);
+  if (rewriteOk) refreshPlexSyncManagedStats();
+  return rewriteOk && (removed || !SD_MMC.exists(checkedPath));
+}
+
+bool ensurePlexSyncFreeSpace(uint64_t incomingBytes) {
+  uint64_t minimumFree = (uint64_t)settings.plexSyncMinFreeGB * 1024ULL * 1024ULL * 1024ULL;
+  for (uint8_t attempt = 0; attempt < 12; attempt++) {
+    uint64_t total = SD_MMC.totalBytes();
+    uint64_t used = SD_MMC.usedBytes();
+    uint64_t freeBytes = total > used ? total - used : 0;
+    if (freeBytes >= minimumFree + incomingBytes) return true;
+    if (!settings.plexSyncPruneManaged || !evictOldestPlexSyncFile()) return false;
+  }
+  return false;
+}
+
+bool isNumericPlexKey(const String &key) {
+  if (!key.length()) return false;
+  for (size_t i = 0; i < key.length(); i++) if (!isDigit(key.charAt(i))) return false;
+  return true;
+}
+
+bool runPlexSyncOnce(bool allowDisabled = false) {
+  plexSyncLastRunMs = millis();
+  if ((!settings.plexSyncEnabled && !allowDisabled) || !plexConfigured()) {
+    setPlexSyncStatus("Sync is not configured");
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    setPlexSyncStatus("Waiting for home WiFi");
+    return false;
+  }
+  if (!isNumericPlexKey(settings.plexSyncSourceKey)) {
+    setPlexSyncStatus("Select a Plex sync source");
+    return false;
+  }
+
+  String destDir = settings.plexSyncDestDir;
+  String pathError;
+  if (!validateUserPath(destDir, false, pathError)) {
+    setPlexSyncStatus("Invalid sync destination");
+    return false;
+  }
+  String sourcePath = settings.plexSyncSourceType == "collection"
+    ? "/library/collections/" + settings.plexSyncSourceKey + "/children"
+    : "/playlists/" + settings.plexSyncSourceKey + "/items";
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(20000);
+  if (!http.begin(client, plexUrlForPath(sourcePath))) {
+    setPlexSyncStatus("Failed to open Plex sync source");
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Accept-Encoding", "identity");
+  int code = http.GET();
+  if (code < 200 || code >= 300) {
+    char message[64];
+    snprintf(message, sizeof(message), "Plex sync source returned HTTP %d", code);
+    setPlexSyncStatus(message);
+    http.end();
+    return false;
+  }
+
+  BasicJsonDocument<PsramJsonAllocator> doc(98304);
+  DeserializationError jsonError = deserializeJson(doc, *http.getStreamPtr());
+  http.end();
+  if (jsonError) {
+    setPlexSyncStatus("Plex sync metadata was invalid or too large");
+    return false;
+  }
+
+  JsonArray items = doc["MediaContainer"]["Metadata"].as<JsonArray>();
+  uint32_t queued = 0;
+  uint64_t reservedBytes = 0;
+  for (JsonObject item : items) {
+    String ratingKey = item["ratingKey"] | "";
+    if (!isNumericPlexKey(ratingKey) || plexSyncManifestContains(ratingKey) ||
+        plexSyncQueueContains(ratingKey)) continue;
+
+    JsonArray media = item["Media"].as<JsonArray>();
+    if (media.size() == 0) continue;
+    JsonArray parts = media[0]["Part"].as<JsonArray>();
+    if (parts.size() == 0) continue;
+    JsonObject part = parts[0];
+    String partKey = part["key"] | "";
+    String sourceFile = part["file"] | "";
+    uint64_t size = part["size"] | 0ULL;
+    if (!partKey.startsWith("/") || size == 0) continue;
+
+    int slash = sourceFile.lastIndexOf('/');
+    int backslash = sourceFile.lastIndexOf('\\');
+    int separator = max(slash, backslash);
+    String originalName = separator >= 0 ? sourceFile.substring(separator + 1) : sourceFile;
+    int dot = originalName.lastIndexOf('.');
+    String extension = dot >= 0 ? originalName.substring(dot + 1) : String(part["container"] | "mp4");
+    extension = plexSyncSafeName(extension);
+    String title = plexSyncSafeName(String(item["title"] | "Plex Item"));
+    int year = item["year"] | 0;
+    if (year > 0) title += " (" + String(year) + ")";
+    String filename = title + " [plex-" + ratingKey + "]." + extension;
+    if (!validateUploadFilename(filename, pathError)) continue;
+    String destPath = destDir + "/" + filename;
+    if (SD_MMC.exists(destPath)) continue;
+
+    if (!ensurePlexSyncFreeSpace(reservedBytes + size)) {
+      setPlexSyncStatus("Storage threshold reached", queued);
+      break;
+    }
+
+    bool locked = plexImportMutex &&
+                  xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(500)) == pdTRUE;
+    if (plexImportMutex && !locked) break;
+    if (plexImportJobs.size() >= PLEX_QUEUE_MAX_JOBS) {
+      if (locked) xSemaphoreGive(plexImportMutex);
+      break;
+    }
+    PlexImportJob *job = new PlexImportJob();
+    if (!job) {
+      if (locked) xSemaphoreGive(plexImportMutex);
+      break;
+    }
+    job->id = plexImportNextId++;
+    job->partKey = partKey;
+    job->destDir = destDir;
+    job->filename = filename;
+    job->label = String("Plex Sync: ") + title;
+    job->reindexRoot = destDir.substring(0, destDir.indexOf('/', 1) > 0
+                                        ? destDir.indexOf('/', 1) : destDir.length());
+    job->destPath = destPath;
+    job->managedSync = true;
+    job->syncRatingKey = ratingKey;
+    plexImportJobs.push_back(job);
+    if (locked) xSemaphoreGive(plexImportMutex);
+    reservedBytes += size;
+    queued++;
+  }
+
+  if (queued) {
+    persistPlexImportQueue();
+    startPlexImportWorkerIfNeeded();
+    setPlexSyncStatus("Sync items queued", queued);
+  } else if (strcmp(plexSyncLastMessage, "Storage threshold reached") != 0) {
+    setPlexSyncStatus("Sync source is up to date", 0);
+  }
+  refreshPlexSyncManagedStats();
+  return true;
+}
+
+void plexSyncTask(void *pvParameters) {
+  (void)pvParameters;
+  bool manualRun = plexSyncManualRequested;
+  plexSyncManualRequested = false;
+  runPlexSyncOnce(manualRun);
+  plexSyncTaskRunning = false;
+  vTaskDeleteWithCaps(NULL);
+}
+
+bool startPlexSyncTask(bool manualRun) {
+  if (plexSyncTaskRunning) return false;
+  plexSyncTaskRunning = true;
+  plexSyncManualRequested = manualRun;
+  BaseType_t result = xTaskCreatePinnedToCoreWithCaps(
+    plexSyncTask, "PlexSync", 10240, NULL, 1, NULL, 0,
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (result != pdPASS) {
+    plexSyncTaskRunning = false;
+    setPlexSyncStatus("Failed to start sync task");
+    return false;
+  }
+  return true;
+}
+
+void plexSyncSchedulerTask(void *pvParameters) {
+  (void)pvParameters;
+  refreshPlexSyncManagedStats();
+  vTaskDelay(pdMS_TO_TICKS(60000));
+  for (;;) {
+    uint32_t intervalMs = (uint32_t)settings.plexSyncIntervalHours * 60UL * 60UL * 1000UL;
+    if (settings.plexSyncEnabled && !plexSyncTaskRunning &&
+        (plexSyncLastRunMs == 0 || millis() - plexSyncLastRunMs >= intervalMs)) {
+      startPlexSyncTask(false);
+    }
+    vTaskDelay(pdMS_TO_TICKS(60000));
+  }
 }
 
 bool startPlexImportWorkerIfNeeded() {
@@ -4772,6 +5181,9 @@ void plexImportTask(void *pvParameters) {
     if (ok) {
       updatePlexJob(job, "done", "Complete", downloaded, total ? total : downloaded, true);
       webLogf("success", "[Plex] Import complete: %s", job->destPath.c_str());
+      if (job->managedSync && !appendPlexSyncManifest(job, downloaded)) {
+        webLog("[Plex Sync] Import completed but manifest update failed", "error");
+      }
       if (job->reindexRoot.length()) enqueueIndexUpdateForPath(job->reindexRoot);
     } else if (cancelled || job->cancelRequested) {
       updatePlexJob(job, "cancelled", "Cancelled; partial file retained", downloaded, total, false);
@@ -6654,6 +7066,14 @@ server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
   doc["homeWifiStatus"] = homeWifiStatusText();
   doc["homeWifiStatusDetail"] = homeWifiStatusDetail();
   doc["bulkTransferMode"] = settings.bulkTransferMode;
+  doc["plexSyncEnabled"] = settings.plexSyncEnabled;
+  doc["plexSyncSourceType"] = settings.plexSyncSourceType;
+  doc["plexSyncSourceKey"] = settings.plexSyncSourceKey;
+  doc["plexSyncLibraryKey"] = settings.plexSyncLibraryKey;
+  doc["plexSyncDestDir"] = settings.plexSyncDestDir;
+  doc["plexSyncIntervalHours"] = settings.plexSyncIntervalHours;
+  doc["plexSyncMinFreeGB"] = settings.plexSyncMinFreeGB;
+  doc["plexSyncPruneManaged"] = settings.plexSyncPruneManaged;
   if (checkAdminAuth(request)) {
     doc["wifiPassword"] = settings.wifiPassword;
     doc["homeWifiPassword"] = settings.homeWifiPassword;
@@ -6706,6 +7126,21 @@ server.on("/settings", HTTP_POST, [](AsyncWebServerRequest *request){
   if (doc.containsKey("plexUrl")) settings.plexUrl = doc["plexUrl"].as<String>();
   if (doc.containsKey("plexToken")) settings.plexToken = doc["plexToken"].as<String>();
   if (doc.containsKey("bulkTransferMode")) settings.bulkTransferMode = doc["bulkTransferMode"].as<bool>();
+  if (doc.containsKey("plexSyncEnabled")) settings.plexSyncEnabled = doc["plexSyncEnabled"].as<bool>();
+  if (doc.containsKey("plexSyncSourceType")) {
+    String type = doc["plexSyncSourceType"].as<String>();
+    if (type == "playlist" || type == "collection") settings.plexSyncSourceType = type;
+  }
+  if (doc.containsKey("plexSyncSourceKey")) settings.plexSyncSourceKey = doc["plexSyncSourceKey"].as<String>();
+  if (doc.containsKey("plexSyncLibraryKey")) settings.plexSyncLibraryKey = doc["plexSyncLibraryKey"].as<String>();
+  if (doc.containsKey("plexSyncDestDir")) settings.plexSyncDestDir = doc["plexSyncDestDir"].as<String>();
+  if (doc.containsKey("plexSyncIntervalHours")) {
+    settings.plexSyncIntervalHours = constrain(doc["plexSyncIntervalHours"].as<int>(), 1, 168);
+  }
+  if (doc.containsKey("plexSyncMinFreeGB")) {
+    settings.plexSyncMinFreeGB = constrain(doc["plexSyncMinFreeGB"].as<int>(), 1, 1000);
+  }
+  if (doc.containsKey("plexSyncPruneManaged")) settings.plexSyncPruneManaged = doc["plexSyncPruneManaged"].as<bool>();
   bool homeWifiChanged = false;
   if (doc.containsKey("homeWifiSSID")) {
     settings.homeWifiSSID = doc["homeWifiSSID"].as<String>();
@@ -6773,6 +7208,54 @@ server.on("/api/plex/episodes", HTTP_GET, [](AsyncWebServerRequest *request){
     }
   }
   sendPlexProxy(request, "/library/metadata/" + ratingKey + "/allLeaves");
+});
+
+server.on("/api/plex/playlists", HTTP_GET, [](AsyncWebServerRequest *request){
+  sendPlexProxy(request, "/playlists?playlistType=video");
+});
+
+server.on("/api/plex/collections", HTTP_GET, [](AsyncWebServerRequest *request){
+  String key = request->hasParam("libraryKey")
+    ? request->getParam("libraryKey")->value() : "";
+  if (!isNumericPlexKey(key)) {
+    request->send(400, "application/json", "{\"error\":\"Invalid library key\"}");
+    return;
+  }
+  sendPlexProxy(request, "/library/sections/" + key + "/collections");
+});
+
+server.on("/api/plex/sync-status", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+  char message[96];
+  portENTER_CRITICAL(&plexSyncStatusMux);
+  strlcpy(message, plexSyncLastMessage, sizeof(message));
+  portEXIT_CRITICAL(&plexSyncStatusMux);
+  StaticJsonDocument<512> doc;
+  doc["enabled"] = settings.plexSyncEnabled;
+  doc["running"] = plexSyncTaskRunning;
+  doc["lastRunMs"] = plexSyncLastRunMs;
+  doc["lastQueued"] = plexSyncLastQueued;
+  doc["message"] = message;
+  doc["managedCount"] = plexSyncManagedCount;
+  doc["managedBytes"] = plexSyncManagedBytes;
+  String body;
+  serializeJson(doc, body);
+  request->send(200, "application/json", body);
+});
+
+server.on("/api/plex/sync", HTTP_POST, [](AsyncWebServerRequest *request){
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+  if (!startPlexSyncTask(true)) {
+    request->send(409, "application/json", "{\"error\":\"Plex sync is already running\"}");
+    return;
+  }
+  request->send(202, "application/json", "{\"status\":\"Sync started\"}");
 });
 
 server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -6901,7 +7384,7 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
       (float)importCopy.downloaded * 1000.0f / (float)(nowMs - importCopy.startedMs);
   }
 
-  StaticJsonDocument<4096> doc;
+  StaticJsonDocument<6144> doc;
   doc["buildId"] = NOMAD_FIRMWARE_BUILD_ID;
   doc["buildColor"] = firmwareBuildColor();
   doc["uptimeMs"] = nowMs;
@@ -7019,6 +7502,19 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
                        ? nowMs - importCopy.startedMs : 0;
   plex["averageBytesPerSec"] = importAverageBytesPerSec;
   plex["averageMiBPerSec"] = importAverageBytesPerSec / 1048576.0f;
+
+  char syncMessage[96];
+  portENTER_CRITICAL(&plexSyncStatusMux);
+  strlcpy(syncMessage, plexSyncLastMessage, sizeof(syncMessage));
+  portEXIT_CRITICAL(&plexSyncStatusMux);
+  JsonObject sync = doc.createNestedObject("plexSync");
+  sync["enabled"] = settings.plexSyncEnabled;
+  sync["running"] = plexSyncTaskRunning;
+  sync["lastRunMs"] = plexSyncLastRunMs;
+  sync["lastQueued"] = plexSyncLastQueued;
+  sync["message"] = syncMessage;
+  sync["managedCount"] = plexSyncManagedCount;
+  sync["managedBytes"] = plexSyncManagedBytes;
 
   std::shared_ptr<PsramResponseBuffer> body = std::make_shared<PsramResponseBuffer>(8192);
   if (!body || !body->data) {
@@ -8319,6 +8815,14 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
     Serial.println("[BootCoord] Failed to spawn Boot Coordinator");
   } else {
     Serial.println("[BootCoord] Task spawned");
+  }
+
+  BaseType_t syncScheduler = xTaskCreatePinnedToCore(
+    plexSyncSchedulerTask, "PlexSyncSchedule", 4096, NULL, 1, NULL, 0);
+  if (syncScheduler != pdPASS) {
+    Serial.println("[Plex Sync] Failed to start scheduler task");
+  } else {
+    Serial.println("[Plex Sync] Scheduler task started");
   }
 }
 // ==================== MAIN LOOP ====================

@@ -349,6 +349,8 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define INDEXER_SLEEP_MS 300000 // 5 minutes between background scans
 #define MAX_CLIENTS 8 // SoftAP max_connection; keep in sync with WiFi.softAP() calls below
 #define PLEX_IMPORT_BUFFER_SIZE 16384
+#define PLEX_PIPELINE_BUFFER_SIZE 65536
+#define PLEX_PIPELINE_BUFFER_COUNT 2
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #define PLEX_QUEUE_PERSIST_INTERVAL_MS 5000UL
 #define PLEX_QUEUE_MAX_JOBS 16
@@ -434,8 +436,27 @@ struct PlexImportJob {
   String message = "Queued";
   uint64_t downloaded = 0;
   uint64_t total = 0;
+  uint64_t transferBytes = 0;
+  uint32_t transferElapsedMs = 0;
+  uint32_t networkActiveMs = 0;
+  uint32_t sdWriteMs = 0;
+  uint32_t pipelineWaitMs = 0;
+  uint32_t pipelineBufferSize = 0;
   bool success = false;
   volatile bool cancelRequested = false;
+};
+
+struct PlexTransferPipeline {
+  File *out = nullptr;
+  uint8_t *buffers[PLEX_PIPELINE_BUFFER_COUNT] = { nullptr, nullptr };
+  size_t lengths[PLEX_PIPELINE_BUFFER_COUNT] = { 0, 0 };
+  QueueHandle_t emptyQueue = nullptr;
+  QueueHandle_t fullQueue = nullptr;
+  SemaphoreHandle_t writerDone = nullptr;
+  volatile bool failed = false;
+  volatile uint64_t bytesWritten = 0;
+  volatile uint32_t sdWriteMs = 0;
+  char error[96] = { 0 };
 };
 
 PlexImportState plexImportState;
@@ -453,6 +474,10 @@ bool persistPlexImportQueue();
 void loadPlexImportQueue();
 bool startPlexImportWorkerIfNeeded();
 void plexImportTask(void *pvParameters);
+void plexPipelineWriterTask(void *pvParameters);
+bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
+                             uint64_t resumeOffset, uint64_t total, String &message,
+                             uint64_t &downloaded);
 volatile unsigned long httpDebugPingCount = 0;
 volatile unsigned long httpDebugStatusCount = 0;
 volatile unsigned long httpLastDebugPingMs = 0;
@@ -3846,6 +3871,12 @@ bool persistPlexImportQueue() {
       doc["message"] = job->message;
       doc["downloaded"] = job->downloaded;
       doc["total"] = job->total;
+      doc["transferBytes"] = job->transferBytes;
+      doc["transferElapsedMs"] = job->transferElapsedMs;
+      doc["networkActiveMs"] = job->networkActiveMs;
+      doc["sdWriteMs"] = job->sdWriteMs;
+      doc["pipelineWaitMs"] = job->pipelineWaitMs;
+      doc["pipelineBufferSize"] = job->pipelineBufferSize;
       doc["success"] = job->success;
       if (serializeJson(doc, out) == 0 || out.print('\n') == 0) {
         ok = false;
@@ -3896,6 +3927,12 @@ void loadPlexImportQueue() {
     job->message = doc["message"] | "Queued";
     job->downloaded = doc["downloaded"] | 0ULL;
     job->total = doc["total"] | 0ULL;
+    job->transferBytes = doc["transferBytes"] | 0ULL;
+    job->transferElapsedMs = doc["transferElapsedMs"] | 0UL;
+    job->networkActiveMs = doc["networkActiveMs"] | 0UL;
+    job->sdWriteMs = doc["sdWriteMs"] | 0UL;
+    job->pipelineWaitMs = doc["pipelineWaitMs"] | 0UL;
+    job->pipelineBufferSize = doc["pipelineBufferSize"] | 0UL;
     job->success = doc["success"] | false;
     job->cancelRequested = false;
     if (job->status == "running" || job->status == "waiting") {
@@ -3987,6 +4024,173 @@ void sendPlexProxy(AsyncWebServerRequest *request, const String &plexPath) {
   request->send(200, "application/json", payload);
 }
 
+void plexPipelineWriterTask(void *pvParameters) {
+  PlexTransferPipeline *pipeline = static_cast<PlexTransferPipeline*>(pvParameters);
+  uint8_t index = 0;
+  while (xQueueReceive(pipeline->fullQueue, &index, portMAX_DELAY) == pdTRUE) {
+    if (index == 0xFF) break;
+    if (!pipeline->failed) {
+      bool writeReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+      if (!writeReady) {
+        pipeline->failed = true;
+        snprintf(pipeline->error, sizeof(pipeline->error), "SD card busy during buffered write");
+      } else {
+        unsigned long writeStartMs = millis();
+        size_t written = 0;
+        uint8_t attempts = 0;
+        while (written < pipeline->lengths[index] && attempts < 4) {
+          size_t part = pipeline->out->write(pipeline->buffers[index] + written,
+                                             pipeline->lengths[index] - written);
+          if (part > 0) {
+            written += part;
+          } else {
+            attempts++;
+            delay(10);
+          }
+        }
+        pipeline->sdWriteMs += millis() - writeStartMs;
+        if (sdMutex) xSemaphoreGive(sdMutex);
+        if (written != pipeline->lengths[index]) {
+          pipeline->failed = true;
+          snprintf(pipeline->error, sizeof(pipeline->error), "Buffered SD write failed");
+        } else {
+          pipeline->bytesWritten += written;
+        }
+      }
+    }
+    xQueueSend(pipeline->emptyQueue, &index, portMAX_DELAY);
+  }
+  xSemaphoreGive(pipeline->writerDone);
+  vTaskDelete(NULL);
+}
+
+bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
+                             uint64_t resumeOffset, uint64_t total, String &message,
+                             uint64_t &downloaded) {
+  PlexTransferPipeline pipeline;
+  pipeline.out = &out;
+  for (uint8_t i = 0; i < PLEX_PIPELINE_BUFFER_COUNT; i++) {
+    pipeline.buffers[i] = static_cast<uint8_t*>(
+      heap_caps_malloc(PLEX_PIPELINE_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!pipeline.buffers[i]) {
+      message = "Not enough PSRAM for transfer pipeline";
+      for (uint8_t j = 0; j < PLEX_PIPELINE_BUFFER_COUNT; j++) {
+        if (pipeline.buffers[j]) heap_caps_free(pipeline.buffers[j]);
+      }
+      return false;
+    }
+  }
+
+  pipeline.emptyQueue = xQueueCreate(PLEX_PIPELINE_BUFFER_COUNT, sizeof(uint8_t));
+  pipeline.fullQueue = xQueueCreate(PLEX_PIPELINE_BUFFER_COUNT + 1, sizeof(uint8_t));
+  pipeline.writerDone = xSemaphoreCreateBinary();
+  if (!pipeline.emptyQueue || !pipeline.fullQueue || !pipeline.writerDone) {
+    message = "Failed to create transfer pipeline";
+    if (pipeline.emptyQueue) vQueueDelete(pipeline.emptyQueue);
+    if (pipeline.fullQueue) vQueueDelete(pipeline.fullQueue);
+    if (pipeline.writerDone) vSemaphoreDelete(pipeline.writerDone);
+    for (uint8_t i = 0; i < PLEX_PIPELINE_BUFFER_COUNT; i++) heap_caps_free(pipeline.buffers[i]);
+    return false;
+  }
+  for (uint8_t i = 0; i < PLEX_PIPELINE_BUFFER_COUNT; i++) {
+    xQueueSend(pipeline.emptyQueue, &i, 0);
+  }
+
+  if (xTaskCreatePinnedToCore(plexPipelineWriterTask, "PlexSDWriter", 4096,
+                              &pipeline, 1, NULL, 1) != pdPASS) {
+    message = "Failed to start SD writer";
+    vQueueDelete(pipeline.emptyQueue);
+    vQueueDelete(pipeline.fullQueue);
+    vSemaphoreDelete(pipeline.writerDone);
+    for (uint8_t i = 0; i < PLEX_PIPELINE_BUFFER_COUNT; i++) heap_caps_free(pipeline.buffers[i]);
+    return false;
+  }
+
+  unsigned long transferStartMs = millis();
+  unsigned long lastStatusMs = transferStartMs;
+  unsigned long lastPersistMs = transferStartMs;
+  uint64_t produced = resumeOffset;
+  bool producerFailed = false;
+  while (stream && stream->connected() && (total == 0 || produced < total)) {
+    if (job->cancelRequested || pipeline.failed) break;
+    uint8_t index = 0;
+    unsigned long waitStartMs = millis();
+    if (xQueueReceive(pipeline.emptyQueue, &index, pdMS_TO_TICKS(5000)) != pdTRUE) {
+      message = "Transfer pipeline stalled";
+      producerFailed = true;
+      break;
+    }
+    job->pipelineWaitMs += millis() - waitStartMs;
+
+    size_t filled = 0;
+    unsigned long networkStartMs = millis();
+    unsigned long bufferStartMs = networkStartMs;
+    while (filled < PLEX_PIPELINE_BUFFER_SIZE && stream->connected()) {
+      if (job->cancelRequested || pipeline.failed) break;
+      size_t available = stream->available();
+      if (available) {
+        size_t toRead = min(available, PLEX_PIPELINE_BUFFER_SIZE - filled);
+        if (total > 0 && total - produced - filled < toRead) {
+          toRead = (size_t)(total - produced - filled);
+        }
+        int readLen = stream->readBytes(pipeline.buffers[index] + filled, toRead);
+        if (readLen <= 0) break;
+        filled += readLen;
+      } else {
+        if (filled > 0 && millis() - bufferStartMs >= 25) break;
+        delay(1);
+      }
+      if (total > 0 && produced + filled >= total) break;
+    }
+    job->networkActiveMs += millis() - networkStartMs;
+    if (filled == 0) {
+      xQueueSend(pipeline.emptyQueue, &index, portMAX_DELAY);
+      break;
+    }
+    pipeline.lengths[index] = filled;
+    if (xQueueSend(pipeline.fullQueue, &index, pdMS_TO_TICKS(5000)) != pdTRUE) {
+      message = "SD writer queue stalled";
+      producerFailed = true;
+      xQueueSend(pipeline.emptyQueue, &index, portMAX_DELAY);
+      break;
+    }
+    produced += filled;
+    downloaded = produced;
+    job->transferBytes = produced - resumeOffset;
+    unsigned long nowMs = millis();
+    job->transferElapsedMs = nowMs - transferStartMs;
+    job->sdWriteMs = pipeline.sdWriteMs;
+    job->pipelineBufferSize = PLEX_PIPELINE_BUFFER_SIZE;
+    if (nowMs - lastStatusMs >= PLEX_IMPORT_STATUS_INTERVAL_MS ||
+        (total > 0 && produced >= total)) {
+      updatePlexJob(job, "running", "Downloading", produced, total, false);
+      lastStatusMs = nowMs;
+    }
+    if (nowMs - lastPersistMs >= PLEX_QUEUE_PERSIST_INTERVAL_MS) {
+      persistPlexImportQueue();
+      lastPersistMs = nowMs;
+    }
+  }
+
+  uint8_t sentinel = 0xFF;
+  xQueueSend(pipeline.fullQueue, &sentinel, pdMS_TO_TICKS(5000));
+  xSemaphoreTake(pipeline.writerDone, portMAX_DELAY);
+  downloaded = resumeOffset + pipeline.bytesWritten;
+  job->transferBytes = pipeline.bytesWritten;
+  job->transferElapsedMs = millis() - transferStartMs;
+  job->sdWriteMs = pipeline.sdWriteMs;
+  job->pipelineBufferSize = PLEX_PIPELINE_BUFFER_SIZE;
+
+  if (pipeline.failed && !message.length()) message = pipeline.error;
+  bool complete = !producerFailed && !pipeline.failed && !job->cancelRequested &&
+                  (total == 0 ? downloaded > resumeOffset : downloaded >= total);
+  vQueueDelete(pipeline.emptyQueue);
+  vQueueDelete(pipeline.fullQueue);
+  vSemaphoreDelete(pipeline.writerDone);
+  for (uint8_t i = 0; i < PLEX_PIPELINE_BUFFER_COUNT; i++) heap_caps_free(pipeline.buffers[i]);
+  return complete;
+}
+
 void plexImportTask(void *pvParameters) {
   (void)pvParameters;
   for (;;) {
@@ -4025,6 +4229,12 @@ void plexImportTask(void *pvParameters) {
     bool cancelled = false;
     uint64_t downloaded = 0;
     uint64_t total = 0;
+    job->transferElapsedMs = 0;
+    job->transferBytes = 0;
+    job->networkActiveMs = 0;
+    job->sdWriteMs = 0;
+    job->pipelineWaitMs = 0;
+    job->pipelineBufferSize = 0;
     updatePlexJob(job, "running", "Preparing", 0, 0, false);
     webLogf("info", "[Plex] Import started: %s", job->label.c_str());
 
@@ -4054,7 +4264,15 @@ void plexImportTask(void *pvParameters) {
                 partial.close();
               }
             }
-            out = SD_MMC.open(tempPath, resumeOffset > 0 ? FILE_APPEND : FILE_WRITE);
+            if (resumeOffset > 0) {
+              out = SD_MMC.open(tempPath, "r+");
+              if (out && !out.seek(resumeOffset, SeekSet)) {
+                out.close();
+                message = "Failed to seek partial download";
+              }
+            } else {
+              out = SD_MMC.open(tempPath, FILE_WRITE);
+            }
             if (sdMutex) xSemaphoreGive(sdMutex);
           }
           if (!fileReady || !out) {
@@ -4108,68 +4326,22 @@ void plexImportTask(void *pvParameters) {
           updatePlexJob(job, "running", resumeOffset ? "Resuming" : "Downloading",
                         downloaded, total, false);
 
-          size_t bufferSize = PLEX_IMPORT_BUFFER_SIZE;
-          uint8_t *buffer = (uint8_t*)malloc(bufferSize);
-          if (!buffer) {
-            bufferSize = 4096;
-            buffer = (uint8_t*)malloc(bufferSize);
-          }
-          if (!buffer) message = "Not enough memory for Plex buffer";
-
           WiFiClient *stream = http.getStreamPtr();
-          unsigned long lastStatusMs = millis();
-          unsigned long lastPersistMs = millis();
-          while (buffer && http.connected() && (total == 0 || downloaded < total)) {
-            if (job->cancelRequested) {
-              cancelled = true;
-              message = "Cancelled";
-              break;
-            }
-            size_t available = stream->available();
-            if (!available) {
-              delay(1);
-              continue;
-            }
-            size_t toRead = min(available, bufferSize);
-            if (total > 0 && total - downloaded < toRead) toRead = (size_t)(total - downloaded);
-            int readLen = stream->readBytes(buffer, toRead);
-            if (readLen <= 0) break;
-
-            bool writeReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
-            if (!writeReady) {
-              message = "SD card busy during write";
-              break;
-            }
-            size_t written = out.write(buffer, readLen);
-            if (sdMutex) xSemaphoreGive(sdMutex);
-            if (written != (size_t)readLen) {
-              message = "SD write failed";
-              break;
-            }
-            downloaded += written;
-            unsigned long nowMs = millis();
-            if (nowMs - lastStatusMs >= PLEX_IMPORT_STATUS_INTERVAL_MS ||
-                (total > 0 && downloaded >= total)) {
-              updatePlexJob(job, "running", "Downloading", downloaded, total, false);
-              lastStatusMs = nowMs;
-            }
-            if (nowMs - lastPersistMs >= PLEX_QUEUE_PERSIST_INTERVAL_MS) {
-              persistPlexImportQueue();
-              lastPersistMs = nowMs;
-            }
-          }
-          if (buffer) free(buffer);
+          ok = runPlexTransferPipeline(job, stream, out, resumeOffset, total,
+                                       message, downloaded);
+          cancelled = job->cancelRequested;
           http.end();
 
           bool closeReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
           if (closeReady) {
             out.flush();
             out.close();
-            if (!cancelled && message.length() == 0 && (total == 0 || downloaded >= total)) {
+            if (ok && !cancelled && message.length() == 0 &&
+                (total == 0 || downloaded >= total)) {
               if (SD_MMC.rename(tempPath, job->destPath)) {
-                ok = true;
                 message = "Complete";
               } else {
+                ok = false;
                 message = "Failed to finalize file";
               }
             }
@@ -6209,6 +6381,21 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
     stream->print(job->success ? "true" : "false");
     stream->printf(",\"downloaded\":%llu", (unsigned long long)job->downloaded);
     stream->printf(",\"total\":%llu", (unsigned long long)job->total);
+    stream->printf(",\"transferBytes\":%llu", (unsigned long long)job->transferBytes);
+    stream->printf(",\"transferElapsedMs\":%u", (unsigned)job->transferElapsedMs);
+    stream->printf(",\"networkActiveMs\":%u", (unsigned)job->networkActiveMs);
+    stream->printf(",\"sdWriteMs\":%u", (unsigned)job->sdWriteMs);
+    stream->printf(",\"pipelineWaitMs\":%u", (unsigned)job->pipelineWaitMs);
+    stream->printf(",\"pipelineBufferSize\":%u", (unsigned)job->pipelineBufferSize);
+    float overallMiBps = job->transferElapsedMs > 0
+      ? ((float)job->transferBytes * 1000.0f / (float)job->transferElapsedMs) / 1048576.0f : 0.0f;
+    float networkMiBps = job->networkActiveMs > 0
+      ? ((float)job->transferBytes * 1000.0f / (float)job->networkActiveMs) / 1048576.0f : 0.0f;
+    float sdMiBps = job->sdWriteMs > 0
+      ? ((float)job->transferBytes * 1000.0f / (float)job->sdWriteMs) / 1048576.0f : 0.0f;
+    stream->printf(",\"overallMiBps\":%.3f", overallMiBps);
+    stream->printf(",\"networkMiBps\":%.3f", networkMiBps);
+    stream->printf(",\"sdMiBps\":%.3f", sdMiBps);
     stream->print(",\"label\":\"" + jsonEscape(job->label) + "\"");
     stream->print(",\"destPath\":\"" + jsonEscape(job->destPath) + "\"");
     stream->print(",\"message\":\"" + jsonEscape(job->message) + "\"}");

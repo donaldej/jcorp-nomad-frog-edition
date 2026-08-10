@@ -4650,33 +4650,18 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, 
     return false;
   }
 
-  size_t size = file.size();
-  if (size > 768 * 1024 || ESP.getFreeHeap() < size + 50000) {
-    file.close();
-    AsyncWebServerResponse *response = request->beginResponse(SD_MMC, filePath, mime);
-    if (sdMutex) xSemaphoreGive(sdMutex);
-    if (!response) {
-      request->send(503, "text/plain", "Low memory serving page; retry after import finishes");
-      return true;
-    }
-    response->addHeader("Cache-Control", "no-store");
-    request->send(response);
+  // Static UI assets are often 20-80 KB. Buffering them into an Arduino String
+  // can consume more heap than the running web server has available, causing
+  // timeouts and fragmentation. Validate the file under sdMutex, then let the
+  // async response stream it from SD instead of copying it into heap.
+  file.close();
+  AsyncWebServerResponse *response = request->beginResponse(SD_MMC, filePath, mime);
+  if (sdMutex) xSemaphoreGive(sdMutex);
+  if (!response) {
+    request->send(503, "text/plain", "Unable to stream file");
     return true;
   }
-
-  String content;
-  content.reserve(size + 1);
-  char buffer[1024];
-  while (file.available()) {
-    size_t readLen = file.readBytes(buffer, sizeof(buffer));
-    if (!readLen) break;
-    content.concat(buffer, readLen);
-    yield();
-  }
-  file.close();
-  if (sdMutex) xSemaphoreGive(sdMutex);
-
-  AsyncWebServerResponse *response = request->beginResponse(200, mime, content);
+  response->addHeader("Accept-Ranges", "bytes");
   response->addHeader("Cache-Control", "no-store");
   request->send(response);
   return true;

@@ -559,6 +559,9 @@
         const total = Number(job.total || 0);
         const downloaded = Number(job.downloaded || 0);
         const percent = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
+        const overall = Number(job.overallMiBps || 0);
+        const network = Number(job.networkMiBps || 0);
+        const sd = Number(job.sdMiBps || 0);
         const row = document.createElement('div');
         row.className = 'queue-row';
         row.innerHTML = `
@@ -573,7 +576,10 @@
         const badge = row.querySelector('.badge');
         badge.textContent = job.status || 'queued';
         badge.classList.add(job.status || 'queued');
-        row.querySelector('.queue-row-meta').textContent = `${job.message || ''}${job.destPath ? ` - ${job.destPath}` : ''}${total ? ` - ${percent}%` : ''}`;
+        const metrics = overall > 0
+          ? ` - ${overall.toFixed(2)} MiB/s overall (network ${network.toFixed(2)}, SD ${sd.toFixed(2)})`
+          : '';
+        row.querySelector('.queue-row-meta').textContent = `${job.message || ''}${job.destPath ? ` - ${job.destPath}` : ''}${total ? ` - ${percent}%` : ''}${metrics}`;
         const actions = row.querySelector('.queue-actions');
         if (['queued', 'waiting', 'running'].includes(job.status)) {
           const cancel = document.createElement('button');

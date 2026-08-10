@@ -149,6 +149,130 @@ function setupLazyFrames() {
   });
 }
 
+function formatHealthBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MiB`;
+  return `${Math.round(bytes / 1024)} KiB`;
+}
+
+function formatHealthDuration(value) {
+  let seconds = Math.max(0, Math.floor((Number(value) || 0) / 1000));
+  const days = Math.floor(seconds / 86400);
+  seconds %= 86400;
+  const hours = Math.floor(seconds / 3600);
+  seconds %= 3600;
+  const minutes = Math.floor(seconds / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function setHealthText(id, value) {
+  const element = document.getElementById(id);
+  if (element) element.textContent = value;
+}
+
+function renderDeviceHealth(data) {
+  const state = document.getElementById('health-state');
+  const heapLow = data.freeHeap < (data.http?.lowHeapWarnBytes || 24576);
+  const heapCritical = data.freeHeap < (data.http?.lowHeapRestartBytes || 16384);
+  const busy = Boolean(data.plexImport?.active || data.tasks?.indexingInProgress ||
+                       data.sd?.scanInProgress || data.tasks?.activeStreams);
+  const blockedSd = data.sd?.mutexExists && !data.sd?.mutexAvailableNow;
+  const criticalStreak = Number(data.http?.criticalHeapStreak) || 0;
+
+  let status = 'Healthy';
+  let statusClass = 'good';
+  if (heapCritical || criticalStreak > 0) {
+    status = 'Critical';
+    statusClass = 'critical';
+  } else if (heapLow || (blockedSd && !busy)) {
+    status = 'Attention';
+    statusClass = 'warning';
+  } else if (busy) {
+    status = 'Busy';
+    statusClass = 'busy';
+  }
+  if (state) {
+    state.textContent = status;
+    state.className = `health-state ${statusClass}`;
+  }
+
+  setHealthText('health-updated', `Updated ${new Date().toLocaleTimeString()}`);
+  setHealthText('health-build', data.buildId || 'Unknown');
+  setHealthText('health-boot', `Boot ${data.restart?.bootCount || 0} | up ${formatHealthDuration(data.uptimeMs)}`);
+
+  setHealthText('health-heap', `${formatHealthBytes(data.freeHeap)} free`);
+  setHealthText('health-heap-detail', `largest ${formatHealthBytes(data.maxAllocHeap)} | minimum ${formatHealthBytes(data.minFreeHeap)}`);
+  setHealthText('health-psram', `${formatHealthBytes(data.freePsram)} free`);
+  setHealthText('health-psram-detail', `largest ${formatHealthBytes(data.maxAllocPsram)} | minimum ${formatHealthBytes(data.minFreePsram)}`);
+
+  const wifi = data.wifi || {};
+  setHealthText('health-wifi', wifi.staConnected ? (wifi.staIp || 'Connected') : 'Offline');
+  setHealthText('health-wifi-detail', wifi.staConnected
+    ? `${wifi.staSsid || 'Home network'} | ${wifi.staRssi || 0} dBm | AP clients ${wifi.apStations || 0}`
+    : `Offline AP ${wifi.apIp || 'active'} | clients ${wifi.apStations || 0}`);
+
+  const sd = data.sd || {};
+  const sdBusy = sd.mutexExists && !sd.mutexAvailableNow;
+  setHealthText('health-sd', sd.scanInProgress ? 'Scanning' : (sdBusy ? 'In use' : 'Ready'));
+  setHealthText('health-sd-detail', `${formatHealthBytes(sd.cachedUsed)} used | lock probe ${sd.mutexProbeMs || 0} ms`);
+
+  const tasks = data.tasks || {};
+  const plex = data.plexImport || {};
+  let activity = 'Idle';
+  let activityDetail = `${tasks.activeStreams || 0} active streams`;
+  if (plex.active) {
+    activity = 'Plex import';
+    const percent = plex.total ? Math.round((plex.downloaded / plex.total) * 100) : 0;
+    activityDetail = `${percent}% | ${(Number(plex.averageMiBPerSec) || 0).toFixed(2)} MiB/s`;
+  } else if (tasks.indexingInProgress) {
+    activity = 'Indexing';
+    activityDetail = `${tasks.indexProgressPercent || 0}% | queue ${tasks.indexQueueDepth || 0}`;
+  } else if (sd.scanInProgress) {
+    activity = 'SD scan';
+  } else if (tasks.activeStreams) {
+    activity = 'Streaming';
+  }
+  setHealthText('health-activity', activity);
+  setHealthText('health-activity-detail', activityDetail);
+
+  const http = data.http || {};
+  const warningCount = Number(http.lowHeapWarnCount) || 0;
+  const criticalCount = Number(http.criticalHeapCount) || 0;
+  setHealthText('health-watchdog', criticalCount ? `${criticalCount} critical events` : 'No critical events');
+  setHealthText('health-watchdog-detail', `${warningCount} low-heap warnings | restart streak ${http.lowHeapRestartStreak || 0}`);
+
+  const restart = data.restart || {};
+  setHealthText('health-restart', restart.previousSnapshotValid
+    ? (restart.previousOperation || restart.previousIntent || 'Recorded')
+    : (restart.currentResetReasonName || 'No history'));
+  setHealthText('health-restart-detail', restart.previousSnapshotValid
+    ? `${restart.previousBuildId || 'unknown build'} | up ${formatHealthDuration(restart.previousUptimeMs)}`
+    : `Current boot: ${restart.currentResetReasonName || 'unknown'}`);
+}
+
+let healthPollActive = false;
+async function fetchDeviceHealth() {
+  if (healthPollActive || document.hidden) return;
+  healthPollActive = true;
+  try {
+    const response = await adminFetch('/api/debug/status', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    renderDeviceHealth(await response.json());
+  } catch (error) {
+    const state = document.getElementById('health-state');
+    if (state) {
+      state.textContent = 'Unavailable';
+      state.className = 'health-state critical';
+    }
+    setHealthText('health-updated', 'Status request failed');
+    console.error('Device health request failed:', error);
+  } finally {
+    healthPollActive = false;
+  }
+}
+
 // full-card walk. the exact "how full is my card" answer - slow (10-20 min), also
 // builds the folder-by-folder breakdown
 async function triggerSDScan() {
@@ -1126,6 +1250,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   fetchSD();
   fetchAdminBar();
   updateTemp();
+  fetchDeviceHealth();
   setTimeout(fetchSdBreakdown, 1500); // shows cached scan data after first render
 
   // Set up RGB controls
@@ -1267,6 +1392,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  const healthRefreshBtn = document.getElementById('health-refresh');
+  if (healthRefreshBtn) {
+    healthRefreshBtn.addEventListener('click', fetchDeviceHealth);
+  }
+
   // Auto-generate toggle
   const autoToggle = document.getElementById('auto-generate');
   if (autoToggle) {
@@ -1352,6 +1482,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setInterval(fetchAdminBar, 30000); // Every 30 seconds
   setInterval(updateTemp, 6000); // Every 6 seconds
   setInterval(fetchSD, 60000); // Every minute
+  setInterval(fetchDeviceHealth, 15000);
 
   // adaptive poll: every 2s while indexing so the bar looks live, 10s when idle.
   // self-reschedules instead of setInterval so it reacts to the last poll

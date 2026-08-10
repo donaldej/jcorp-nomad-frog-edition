@@ -11,6 +11,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <map>
+#include <memory>
 #include <vector>
 #include <time.h>
 #include "Display_ST7789.h"
@@ -20,6 +21,7 @@
 #include <SPIFFS.h>
 #include <Preferences.h>
 #include "esp_wifi.h"
+#include "freertos/idf_additions.h"
 #if defined(ARDUINO_ARCH_ESP32)
   #include "soc/soc.h"
   #include "soc/rtc_cntl_reg.h"
@@ -457,6 +459,12 @@ struct PlexTransferPipeline {
   volatile uint64_t bytesWritten = 0;
   volatile uint32_t sdWriteMs = 0;
   char error[96] = { 0 };
+};
+
+struct PlexProxyContext {
+  WiFiClient client;
+  HTTPClient http;
+  ~PlexProxyContext() { http.end(); }
 };
 
 PlexImportState plexImportState;
@@ -3957,7 +3965,9 @@ bool startPlexImportWorkerIfNeeded() {
   }
   plexImportWorkerRunning = true;
   if (locked) xSemaphoreGive(plexImportMutex);
-  BaseType_t created = xTaskCreatePinnedToCore(plexImportTask, "PlexImport", 10240, NULL, 1, NULL, 0);
+  BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+    plexImportTask, "PlexImport", 10240, NULL, 1, NULL, 0,
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (created != pdPASS) {
     plexImportWorkerRunning = false;
     return false;
@@ -4003,25 +4013,44 @@ void sendPlexProxy(AsyncWebServerRequest *request, const String &plexPath) {
     return;
   }
 
-  WiFiClient client;
-  HTTPClient http;
+  std::shared_ptr<PlexProxyContext> proxy = std::make_shared<PlexProxyContext>();
+  if (!proxy) {
+    request->send(503, "application/json", "{\"error\":\"Not enough memory for Plex request\"}");
+    return;
+  }
   String url = plexUrlForPath(plexPath);
-  http.setTimeout(12000);
-  if (!http.begin(client, url)) {
+  proxy->http.setTimeout(12000);
+  if (!proxy->http.begin(proxy->client, url)) {
     request->send(500, "application/json", "{\"error\":\"Failed to initialize Plex request\"}");
     return;
   }
-  http.addHeader("Accept", "application/json");
-  int code = http.GET();
-  String payload = (code > 0) ? http.getString() : "";
-  http.end();
+  proxy->http.addHeader("Accept", "application/json");
+  proxy->http.addHeader("Accept-Encoding", "identity");
+  int code = proxy->http.GET();
 
   if (code < 200 || code >= 300) {
     request->send(502, "application/json",
                   String("{\"error\":\"Plex request failed\",\"status\":") + String(code) + "}");
     return;
   }
-  request->send(200, "application/json", payload);
+  int contentLength = proxy->http.getSize();
+  AwsResponseFiller filler = [proxy](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+    (void)index;
+    WiFiClient *stream = proxy->http.getStreamPtr();
+    if (!stream) return 0;
+    size_t available = stream->available();
+    if (!available) return stream->connected() ? RESPONSE_TRY_AGAIN : 0;
+    return stream->readBytes(buffer, min(available, maxLen));
+  };
+  AsyncWebServerResponse *response = contentLength > 0
+    ? request->beginResponse("application/json", (size_t)contentLength, filler)
+    : request->beginChunkedResponse("application/json", filler);
+  if (!response) {
+    request->send(503, "application/json", "{\"error\":\"Not enough memory to stream Plex response\"}");
+    return;
+  }
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
 }
 
 void plexPipelineWriterTask(void *pvParameters) {
@@ -4061,7 +4090,7 @@ void plexPipelineWriterTask(void *pvParameters) {
     xQueueSend(pipeline->emptyQueue, &index, portMAX_DELAY);
   }
   xSemaphoreGive(pipeline->writerDone);
-  vTaskDelete(NULL);
+  vTaskDeleteWithCaps(NULL);
 }
 
 bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
@@ -4096,8 +4125,9 @@ bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
     xQueueSend(pipeline.emptyQueue, &i, 0);
   }
 
-  if (xTaskCreatePinnedToCore(plexPipelineWriterTask, "PlexSDWriter", 4096,
-                              &pipeline, 1, NULL, 1) != pdPASS) {
+  if (xTaskCreatePinnedToCoreWithCaps(
+        plexPipelineWriterTask, "PlexSDWriter", 4096, &pipeline, 1, NULL, 1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
     message = "Failed to start SD writer";
     vQueueDelete(pipeline.emptyQueue);
     vQueueDelete(pipeline.fullQueue);
@@ -4208,7 +4238,7 @@ void plexImportTask(void *pvParameters) {
     if (!job) {
       plexImportWorkerRunning = false;
       plexImportState.active = false;
-      vTaskDelete(NULL);
+      vTaskDeleteWithCaps(NULL);
       return;
     }
 
@@ -7509,6 +7539,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
       (void)param;
       unsigned long lastLogMs = 0;
       unsigned long lastSampleMs = 0;
+      size_t observedMinHeap = SIZE_MAX;
       for (;;) {
         unsigned long nowMs = millis();
         if (nowMs - lastSampleMs >= HTTP_HEALTH_SAMPLE_INTERVAL_MS) {
@@ -7520,7 +7551,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
           healthLastMinFreeHeap = minHeap;
           healthLastMaxAllocHeap = maxAlloc;
 
-          if (freeHeap < HEALTH_LOW_HEAP_WARN_BYTES || minHeap < HEALTH_LOW_HEAP_WARN_BYTES) {
+          if (freeHeap < HEALTH_LOW_HEAP_WARN_BYTES) {
             healthLowHeapWarnCount++;
             healthLastLowHeapMs = nowMs;
           }
@@ -7529,10 +7560,15 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
           } else {
             healthLowHeapRestartStreak = 0;
           }
-          if (minHeap < HEALTH_CRITICAL_MIN_HEAP_BYTES) {
-            healthCriticalHeapCount++;
+          if (minHeap < observedMinHeap) {
+            observedMinHeap = minHeap;
+            if (minHeap < HEALTH_CRITICAL_MIN_HEAP_BYTES) {
+              healthCriticalHeapCount++;
+              healthLastCriticalHeapMs = nowMs;
+            }
+          }
+          if (freeHeap < HEALTH_CRITICAL_MIN_HEAP_BYTES) {
             healthCriticalHeapStreak++;
-            healthLastCriticalHeapMs = nowMs;
           } else {
             healthCriticalHeapStreak = 0;
           }
@@ -7542,10 +7578,10 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
 
           bool shouldRestartForCurrentHeap =
             healthLowHeapRestartStreak >= HEALTH_LOW_HEAP_RESTART_STREAK;
-          bool shouldRestartForLowWater =
+          bool shouldRestartForCriticalHeap =
             healthCriticalHeapStreak >= HEALTH_CRITICAL_HEAP_STREAK;
           if (nowMs > HEALTH_MIN_UPTIME_BEFORE_RESTART_MS &&
-              (shouldRestartForCurrentHeap || shouldRestartForLowWater) &&
+              (shouldRestartForCurrentHeap || shouldRestartForCriticalHeap) &&
               !plexImportActiveSnapshot()) {
             Serial.printf("[HEALTH] heap watchdog restart: free=%u min=%u largest=%u lowStreak=%u criticalStreak=%u\n",
                           (unsigned)freeHeap,

@@ -505,7 +505,7 @@ struct RestartSnapshot {
   char buildId[24];
 };
 
-RTC_DATA_ATTR RestartSnapshot rtcRestartSnapshot;
+RTC_NOINIT_ATTR RestartSnapshot rtcRestartSnapshot;
 RestartSnapshot previousRestartSnapshot;
 bool previousRestartSnapshotValid = false;
 uint32_t persistentBootCount = 0;

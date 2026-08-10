@@ -436,6 +436,7 @@ struct PlexImportJob {
   String message = "Queued";
   uint64_t downloaded = 0;
   uint64_t total = 0;
+  uint64_t transferBytes = 0;
   uint32_t transferElapsedMs = 0;
   uint32_t networkActiveMs = 0;
   uint32_t sdWriteMs = 0;
@@ -3870,6 +3871,7 @@ bool persistPlexImportQueue() {
       doc["message"] = job->message;
       doc["downloaded"] = job->downloaded;
       doc["total"] = job->total;
+      doc["transferBytes"] = job->transferBytes;
       doc["transferElapsedMs"] = job->transferElapsedMs;
       doc["networkActiveMs"] = job->networkActiveMs;
       doc["sdWriteMs"] = job->sdWriteMs;
@@ -3925,6 +3927,7 @@ void loadPlexImportQueue() {
     job->message = doc["message"] | "Queued";
     job->downloaded = doc["downloaded"] | 0ULL;
     job->total = doc["total"] | 0ULL;
+    job->transferBytes = doc["transferBytes"] | 0ULL;
     job->transferElapsedMs = doc["transferElapsedMs"] | 0UL;
     job->networkActiveMs = doc["networkActiveMs"] | 0UL;
     job->sdWriteMs = doc["sdWriteMs"] | 0UL;
@@ -4153,6 +4156,7 @@ bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
     }
     produced += filled;
     downloaded = produced;
+    job->transferBytes = produced - resumeOffset;
     unsigned long nowMs = millis();
     job->transferElapsedMs = nowMs - transferStartMs;
     job->sdWriteMs = pipeline.sdWriteMs;
@@ -4172,6 +4176,7 @@ bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
   xQueueSend(pipeline.fullQueue, &sentinel, pdMS_TO_TICKS(5000));
   xSemaphoreTake(pipeline.writerDone, portMAX_DELAY);
   downloaded = resumeOffset + pipeline.bytesWritten;
+  job->transferBytes = pipeline.bytesWritten;
   job->transferElapsedMs = millis() - transferStartMs;
   job->sdWriteMs = pipeline.sdWriteMs;
   job->pipelineBufferSize = PLEX_PIPELINE_BUFFER_SIZE;
@@ -4225,6 +4230,7 @@ void plexImportTask(void *pvParameters) {
     uint64_t downloaded = 0;
     uint64_t total = 0;
     job->transferElapsedMs = 0;
+    job->transferBytes = 0;
     job->networkActiveMs = 0;
     job->sdWriteMs = 0;
     job->pipelineWaitMs = 0;
@@ -4258,7 +4264,15 @@ void plexImportTask(void *pvParameters) {
                 partial.close();
               }
             }
-            out = SD_MMC.open(tempPath, resumeOffset > 0 ? FILE_APPEND : FILE_WRITE);
+            if (resumeOffset > 0) {
+              out = SD_MMC.open(tempPath, "r+");
+              if (out && !out.seek(resumeOffset, SeekSet)) {
+                out.close();
+                message = "Failed to seek partial download";
+              }
+            } else {
+              out = SD_MMC.open(tempPath, FILE_WRITE);
+            }
             if (sdMutex) xSemaphoreGive(sdMutex);
           }
           if (!fileReady || !out) {
@@ -6367,17 +6381,18 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
     stream->print(job->success ? "true" : "false");
     stream->printf(",\"downloaded\":%llu", (unsigned long long)job->downloaded);
     stream->printf(",\"total\":%llu", (unsigned long long)job->total);
+    stream->printf(",\"transferBytes\":%llu", (unsigned long long)job->transferBytes);
     stream->printf(",\"transferElapsedMs\":%u", (unsigned)job->transferElapsedMs);
     stream->printf(",\"networkActiveMs\":%u", (unsigned)job->networkActiveMs);
     stream->printf(",\"sdWriteMs\":%u", (unsigned)job->sdWriteMs);
     stream->printf(",\"pipelineWaitMs\":%u", (unsigned)job->pipelineWaitMs);
     stream->printf(",\"pipelineBufferSize\":%u", (unsigned)job->pipelineBufferSize);
     float overallMiBps = job->transferElapsedMs > 0
-      ? ((float)job->downloaded * 1000.0f / (float)job->transferElapsedMs) / 1048576.0f : 0.0f;
+      ? ((float)job->transferBytes * 1000.0f / (float)job->transferElapsedMs) / 1048576.0f : 0.0f;
     float networkMiBps = job->networkActiveMs > 0
-      ? ((float)job->downloaded * 1000.0f / (float)job->networkActiveMs) / 1048576.0f : 0.0f;
+      ? ((float)job->transferBytes * 1000.0f / (float)job->networkActiveMs) / 1048576.0f : 0.0f;
     float sdMiBps = job->sdWriteMs > 0
-      ? ((float)job->downloaded * 1000.0f / (float)job->sdWriteMs) / 1048576.0f : 0.0f;
+      ? ((float)job->transferBytes * 1000.0f / (float)job->sdWriteMs) / 1048576.0f : 0.0f;
     stream->printf(",\"overallMiBps\":%.3f", overallMiBps);
     stream->printf(",\"networkMiBps\":%.3f", networkMiBps);
     stream->printf(",\"sdMiBps\":%.3f", sdMiBps);

@@ -4033,7 +4033,18 @@ void plexPipelineWriterTask(void *pvParameters) {
         snprintf(pipeline->error, sizeof(pipeline->error), "SD card busy during buffered write");
       } else {
         unsigned long writeStartMs = millis();
-        size_t written = pipeline->out->write(pipeline->buffers[index], pipeline->lengths[index]);
+        size_t written = 0;
+        uint8_t attempts = 0;
+        while (written < pipeline->lengths[index] && attempts < 4) {
+          size_t part = pipeline->out->write(pipeline->buffers[index] + written,
+                                             pipeline->lengths[index] - written);
+          if (part > 0) {
+            written += part;
+          } else {
+            attempts++;
+            delay(10);
+          }
+        }
         pipeline->sdWriteMs += millis() - writeStartMs;
         if (sdMutex) xSemaphoreGive(sdMutex);
         if (written != pipeline->lengths[index]) {
@@ -4213,6 +4224,11 @@ void plexImportTask(void *pvParameters) {
     bool cancelled = false;
     uint64_t downloaded = 0;
     uint64_t total = 0;
+    job->transferElapsedMs = 0;
+    job->networkActiveMs = 0;
+    job->sdWriteMs = 0;
+    job->pipelineWaitMs = 0;
+    job->pipelineBufferSize = 0;
     updatePlexJob(job, "running", "Preparing", 0, 0, false);
     webLogf("info", "[Plex] Import started: %s", job->label.c_str());
 

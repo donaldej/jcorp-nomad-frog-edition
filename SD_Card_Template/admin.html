@@ -3,7 +3,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="nomad-ui-build-id" content="ui-20260809-001">
+  <meta name="nomad-ui-build-id" content="ui-20260809-002">
   <link rel="stylesheet" href="/master.css">
   <script src="/theme-boot.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -483,10 +483,93 @@
       margin-top: 1rem;
     }
 
+    .health-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .health-header h2 {
+      margin-bottom: 0;
+    }
+
+    .health-summary {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      min-width: 0;
+    }
+
+    .health-state {
+      display: inline-flex;
+      align-items: center;
+      min-height: 1.75rem;
+      padding: 0.2rem 0.65rem;
+      border-radius: 0.375rem;
+      background: var(--secondary);
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .health-state.good { background: var(--success); }
+    .health-state.busy { background: var(--info); }
+    .health-state.warning { background: var(--warning); color: #212529; }
+    .health-state.critical { background: var(--danger); }
+
+    .health-updated {
+      color: var(--muted);
+      font-size: 0.8rem;
+      white-space: nowrap;
+    }
+
+    .health-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.75rem;
+    }
+
+    .health-metric {
+      min-width: 0;
+      padding: 0.85rem;
+      border: 1px solid var(--card-border);
+      border-radius: 0.375rem;
+      background: var(--bg);
+    }
+
+    .health-metric-label {
+      color: var(--muted);
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .health-metric-value {
+      margin-top: 0.25rem;
+      color: var(--text);
+      font-size: 1rem;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .health-metric-detail {
+      margin-top: 0.2rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+      overflow-wrap: anywhere;
+    }
+
     @media (max-width: 768px) {
       .home-wifi-layout,
       .home-wifi-status {
         grid-template-columns: 1fr;
+      }
+
+      .health-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
 
@@ -592,6 +675,15 @@
 
       .btn {
         width: 100%;
+      }
+
+      .health-header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .health-grid {
+        grid-template-columns: 1fr;
       }
 
       .device-info {
@@ -903,6 +995,60 @@
         <div class="home-wifi-actions">
           <button id="home-wifi-reconnect" class="btn btn-secondary" type="button">Reconnect</button>
           <button id="home-wifi-forget" class="btn btn-danger" type="button">Forget Home WiFi</button>
+        </div>
+      </div>
+
+      <!-- Device Health -->
+      <div class="card health-section">
+        <div class="health-header">
+          <h2>Device Health</h2>
+          <div class="health-summary">
+            <span id="health-state" class="health-state">Loading</span>
+            <span id="health-updated" class="health-updated">Waiting for status</span>
+            <button id="health-refresh" class="btn btn-secondary" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="health-grid" aria-live="polite">
+          <div class="health-metric">
+            <div class="health-metric-label">Firmware</div>
+            <div id="health-build" class="health-metric-value">-</div>
+            <div id="health-boot" class="health-metric-detail">-</div>
+          </div>
+          <div class="health-metric">
+            <div class="health-metric-label">Internal Heap</div>
+            <div id="health-heap" class="health-metric-value">-</div>
+            <div id="health-heap-detail" class="health-metric-detail">-</div>
+          </div>
+          <div class="health-metric">
+            <div class="health-metric-label">PSRAM</div>
+            <div id="health-psram" class="health-metric-value">-</div>
+            <div id="health-psram-detail" class="health-metric-detail">-</div>
+          </div>
+          <div class="health-metric">
+            <div class="health-metric-label">Home WiFi</div>
+            <div id="health-wifi" class="health-metric-value">-</div>
+            <div id="health-wifi-detail" class="health-metric-detail">-</div>
+          </div>
+          <div class="health-metric">
+            <div class="health-metric-label">SD Card</div>
+            <div id="health-sd" class="health-metric-value">-</div>
+            <div id="health-sd-detail" class="health-metric-detail">-</div>
+          </div>
+          <div class="health-metric">
+            <div class="health-metric-label">Current Activity</div>
+            <div id="health-activity" class="health-metric-value">-</div>
+            <div id="health-activity-detail" class="health-metric-detail">-</div>
+          </div>
+          <div class="health-metric">
+            <div class="health-metric-label">HTTP Watchdog</div>
+            <div id="health-watchdog" class="health-metric-value">-</div>
+            <div id="health-watchdog-detail" class="health-metric-detail">-</div>
+          </div>
+          <div class="health-metric">
+            <div class="health-metric-label">Previous Restart</div>
+            <div id="health-restart" class="health-metric-value">-</div>
+            <div id="health-restart-detail" class="health-metric-detail">-</div>
+          </div>
         </div>
       </div>
 

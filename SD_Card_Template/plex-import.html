@@ -163,6 +163,14 @@
     .badge.failed, .badge.cancelled { background: var(--danger, #dc3545); }
     .auth-panel { display: none; }
     .auth-panel.visible { display: block; }
+    .mode-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      min-height: 2.5rem;
+      color: var(--text);
+    }
+    .mode-toggle input { width: auto; }
     @media (max-width: 820px) {
       .grid { grid-template-columns: 1fr; }
       .header { align-items: flex-start; flex-direction: column; gap: 0.75rem; }
@@ -209,6 +217,10 @@
       <div class="toolbar" style="margin-top:1rem;">
         <button id="save-settings" class="btn btn-primary">Save Plex Settings</button>
         <button id="load-libraries" class="btn btn-success">Load Libraries</button>
+        <label class="mode-toggle">
+          <input id="bulk-transfer-mode" type="checkbox">
+          Bulk Transfer Mode
+        </label>
       </div>
       <div id="connection-message" class="muted" style="margin-top:0.75rem;"></div>
     </section>
@@ -271,6 +283,7 @@
       authMessage: document.getElementById('auth-message'),
       plexUrl: document.getElementById('plex-url'),
       plexToken: document.getElementById('plex-token'),
+      bulkTransferMode: document.getElementById('bulk-transfer-mode'),
       saveSettings: document.getElementById('save-settings'),
       loadLibraries: document.getElementById('load-libraries'),
       connectionMessage: document.getElementById('connection-message'),
@@ -434,6 +447,7 @@
         if (settings.adminPasswordSet && !adminToken()) els.authPanel.classList.add('visible');
         els.plexUrl.value = settings.plexUrl || '';
         els.plexToken.value = settings.plexToken || '';
+        els.bulkTransferMode.checked = Boolean(settings.bulkTransferMode);
       } catch (e) {
         els.connectionMessage.textContent = e.message;
       }
@@ -442,7 +456,8 @@
     async function saveSettings() {
       const body = {
         plexUrl: els.plexUrl.value.trim(),
-        plexToken: els.plexToken.value.trim()
+        plexToken: els.plexToken.value.trim(),
+        bulkTransferMode: els.bulkTransferMode.checked
       };
       await api('/settings', {
         method: 'POST',

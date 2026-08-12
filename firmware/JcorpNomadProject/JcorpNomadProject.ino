@@ -610,6 +610,8 @@ volatile unsigned long healthLastCriticalHeapMs = 0;
 volatile size_t healthLastFreeHeap = 0;
 volatile size_t healthLastMinFreeHeap = 0;
 volatile size_t healthLastMaxAllocHeap = 0;
+volatile uint32_t backgroundPsramTaskCount = 0;
+volatile uint32_t backgroundInternalTaskCount = 0;
 volatile bool plexSyncTaskRunning = false;
 volatile bool plexSyncManualRequested = false;
 volatile unsigned long plexSyncLastRunMs = 0;
@@ -623,6 +625,29 @@ volatile bool otaValidationPending = false;
 volatile unsigned long otaRestartAtMs = 0;
 uint32_t otaBootAttempts = 0;
 uint32_t otaPreviousPartitionAddress = 0;
+
+BaseType_t createBackgroundTask(
+    TaskFunction_t task, const char *name, uint32_t stackDepth, void *parameter,
+    UBaseType_t priority, TaskHandle_t *handle, BaseType_t core) {
+  BaseType_t result = xTaskCreatePinnedToCoreWithCaps(
+    task, name, stackDepth, parameter, priority, handle, core,
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (result == pdPASS) {
+    backgroundPsramTaskCount++;
+    Serial.printf("[TaskMgr] %s stack allocated in PSRAM (%u bytes)\n",
+                  name, (unsigned)stackDepth);
+    return result;
+  }
+
+  result = xTaskCreatePinnedToCoreWithCaps(
+    task, name, stackDepth, parameter, priority, handle, core,
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (result == pdPASS) {
+    backgroundInternalTaskCount++;
+    Serial.printf("[TaskMgr] %s PSRAM stack unavailable; using internal RAM\n", name);
+  }
+  return result;
+}
 
 struct OtaUploadContext {
   bool authorized = false;
@@ -5292,7 +5317,7 @@ void indexWorkerTask(void *param) {
       Serial.println("[IndexWorker] Shutting down to prioritize media streaming");
       indexWorkerTaskHandle = nullptr;
       indexingTasksActive = false;
-      vTaskDelete(NULL);
+      vTaskDeleteWithCaps(NULL);
       return;
     }
 
@@ -5457,7 +5482,7 @@ void indexWorkerTask(void *param) {
         Serial.println("[IndexWorker] Shutting down, discarding queued index request");
         indexWorkerTaskHandle = nullptr;
         indexingTasksActive = false;
-        vTaskDelete(NULL);
+        vTaskDeleteWithCaps(NULL);
         return;
       }
 
@@ -5584,7 +5609,7 @@ void storageMonitorTask(void *param) {
         if (shutdownBackgroundTasks) {
             webLog("[StorageMonitor] Shutting down to prioritize media streaming", "warning");
             storageMonitorTaskHandle = nullptr;
-            vTaskDelete(NULL);
+            vTaskDeleteWithCaps(NULL);
             return;
         }
 
@@ -5606,7 +5631,7 @@ void immediateEnqueueTopLevelTask(void *param) {
   if (!root || !root.isDirectory()) {
     if (root) root.close();
     Serial.println("[Index] immediateEnqueueTopLevelTask: root not available, exiting task");
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
     return;
   }
 
@@ -5646,7 +5671,7 @@ void immediateEnqueueTopLevelTask(void *param) {
   root.close();
 
   Serial.println("[Index] immediateEnqueueTopLevelTask: enqueue complete, exiting");
-  vTaskDelete(NULL);
+  vTaskDeleteWithCaps(NULL);
 }
 
 // Task lifecycle management functions for performance optimization
@@ -5677,7 +5702,8 @@ void startBackgroundTasksIfNeeded() {
     if (indexWorkerTaskHandle == nullptr) {
       // Small delay to prevent immediate resource contention
       vTaskDelay(pdMS_TO_TICKS(50));
-      BaseType_t r = xTaskCreatePinnedToCore(indexWorkerTask, "IndexWorker", 16 * 1024, NULL, 2, &indexWorkerTaskHandle, 0);
+      BaseType_t r = createBackgroundTask(indexWorkerTask, "IndexWorker", 16 * 1024,
+                                          NULL, 2, &indexWorkerTaskHandle, 0);
       if (r != pdPASS) {
         Serial.println("[TaskMgr] Failed to restart IndexWorker task");
         webLog("[ERROR] Failed to restart IndexWorker task", "error");
@@ -5690,7 +5716,8 @@ void startBackgroundTasksIfNeeded() {
     if (storageMonitorTaskHandle == nullptr) {
       // Small delay to prevent immediate resource contention
       vTaskDelay(pdMS_TO_TICKS(50));
-      BaseType_t r = xTaskCreatePinnedToCore(storageMonitorTask, "StorageMonitor", 4096, NULL, 1, &storageMonitorTaskHandle, 0);
+      BaseType_t r = createBackgroundTask(storageMonitorTask, "StorageMonitor", 4096,
+                                          NULL, 1, &storageMonitorTaskHandle, 0);
       if (r != pdPASS) {
         Serial.println("[TaskMgr] Failed to restart StorageMonitor task");
         webLog("[ERROR] Failed to restart StorageMonitor task", "error");
@@ -5780,7 +5807,7 @@ void bootCoordinatorTask(void *pv) {
     requestIndexing = true;
     Serial.println("[BootCoord] First-time index build queued via normal scan path");
     Serial.println("[BootCoord] coordination done; exiting task");
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
     return;
   }
 
@@ -5792,7 +5819,8 @@ void bootCoordinatorTask(void *pv) {
     sdScanCompleted = false;
     sdScanInProgress = false;
 
-    BaseType_t ir = xTaskCreatePinnedToCore(immediateEnqueueTopLevelTask, "IncScanBoot", 12 * 1024, NULL, 1, NULL, 1);
+    BaseType_t ir = createBackgroundTask(immediateEnqueueTopLevelTask, "IncScanBoot",
+                                         12 * 1024, NULL, 1, NULL, 1);
     if (ir == pdPASS) {
       Serial.println("[BootCoord] Top-level enqueue task started to populate index queue");
     }
@@ -5808,7 +5836,7 @@ void bootCoordinatorTask(void *pv) {
 
   vTaskDelay(pdMS_TO_TICKS(100));
   Serial.println("[BootCoord] boot coordination done; exiting task");
-  vTaskDelete(NULL);
+  vTaskDeleteWithCaps(NULL);
 }
 
 // --- Captive portal throttled logging ---
@@ -6241,7 +6269,8 @@ Serial.println("SD Card initialized successfully!");
     updateSDBAR(); // will show cached values loaded above (if any)
 
     // Start the storage monitor (unchanged)
-    xTaskCreatePinnedToCore(storageMonitorTask, "StorageMonitor", 4096, NULL, 1, &storageMonitorTaskHandle, 0);
+    createBackgroundTask(storageMonitorTask, "StorageMonitor", 4096,
+                         NULL, 1, &storageMonitorTaskHandle, 0);
 
     // Continue registering handlers (unchanged)
     createSimpleUploadHandler("Movies", "/upload-movie");
@@ -6502,7 +6531,8 @@ Serial.println("SD Card initialized successfully!");
 
       // manual index is always full, so enqueue the non-bucket top-level folders too
       // (the boot enqueue only runs on detected changes now, cant rely on it)
-      BaseType_t tr = xTaskCreatePinnedToCore(immediateEnqueueTopLevelTask, "ImmediateEnq", 6 * 1024, NULL, 1, NULL, 1);
+      BaseType_t tr = createBackgroundTask(immediateEnqueueTopLevelTask, "ImmediateEnq",
+                                           6 * 1024, NULL, 1, NULL, 1);
       if (tr == pdPASS) {
         webLog("[ADMIN] Starting immediate index task", "info");
       } else {
@@ -7466,6 +7496,8 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   tasks["activeStreams"] = streamCount;
   tasks["mediaStreamingActive"] = mediaStreamingActive;
   tasks["lastStreamIoAgeMs"] = lastStreamIoMs > 0 ? nowMs - lastStreamIoMs : 0;
+  tasks["psramStackTasksCreated"] = backgroundPsramTaskCount;
+  tasks["internalStackFallbacks"] = backgroundInternalTaskCount;
 
   JsonObject http = doc.createNestedObject("http");
   http["debugPingCount"] = httpDebugPingCount;
@@ -8605,7 +8637,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
       webLog("[SYSTEM] Failed to start streaming task", "error");
     }
 
-    t = xTaskCreatePinnedToCore(+[](void *param){
+    t = createBackgroundTask(+[](void *param){
       (void)param;
       unsigned long lastLogMs = 0;
       unsigned long lastSampleMs = 0;
@@ -8714,7 +8746,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
 
         vTaskDelay(pdMS_TO_TICKS(1000));
       }
-      vTaskDelete(NULL);
+      vTaskDeleteWithCaps(NULL);
     }, "HttpHealth", 3 * 1024, NULL, 1, NULL, 0);
     if (t == pdPASS) {
       webLog("[SYSTEM] HTTP health watchdog started", "success");
@@ -8768,7 +8800,8 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
   // heavy indexing in background without blocking boot.
   static bool indexWorkerStarted = false;
   if (!indexWorkerStarted && indexQueue) {
-    BaseType_t r = xTaskCreatePinnedToCore(indexWorkerTask, "IndexWorker", 16 * 1024, NULL, 2, &indexWorkerTaskHandle, 0);
+    BaseType_t r = createBackgroundTask(indexWorkerTask, "IndexWorker", 16 * 1024,
+                                        NULL, 2, &indexWorkerTaskHandle, 0);
     if (r == pdPASS) {
       Serial.println("[IndexWorker] Task started");
       webLog("[SYSTEM] Index worker task started successfully", "success");
@@ -8810,14 +8843,15 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
   }
 
   // Spawn bootCoordinatorTask so it can schedule boot-time scans without blocking setup.
-  BaseType_t br = xTaskCreatePinnedToCore(bootCoordinatorTask, "BootCoord", 8 * 1024, NULL, 1, NULL, 1);
+  BaseType_t br = createBackgroundTask(bootCoordinatorTask, "BootCoord", 8 * 1024,
+                                       NULL, 1, NULL, 1);
   if (br != pdPASS) {
     Serial.println("[BootCoord] Failed to spawn Boot Coordinator");
   } else {
     Serial.println("[BootCoord] Task spawned");
   }
 
-  BaseType_t syncScheduler = xTaskCreatePinnedToCore(
+  BaseType_t syncScheduler = createBackgroundTask(
     plexSyncSchedulerTask, "PlexSyncSchedule", 4096, NULL, 1, NULL, 0);
   if (syncScheduler != pdPASS) {
     Serial.println("[Plex Sync] Failed to start scheduler task");

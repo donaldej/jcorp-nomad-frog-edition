@@ -20,7 +20,6 @@ for (const taskName of [
   'StorageMonitor',
   'IncScanBoot',
   'ImmediateEnq',
-  'HttpHealth',
   'BootCoord',
   'PlexSyncSchedule'
 ]) {
@@ -44,9 +43,15 @@ assert.match(
   /xTaskCreatePinnedToCore\(\+\[\]\(void \*param\)[\s\S]{0,1200}"UiTask"/,
   'the LVGL UI task must retain an internal stack'
 );
+assert.match(
+  firmware,
+  /xTaskCreatePinnedToCore\(\+\[\]\(void \*param\)[\s\S]{1000,7000}recordRestartIntent\("heap-watchdog"\)[\s\S]{0,2500}"HttpHealth"/,
+  'the NVS-writing health task must retain an internal stack'
+);
 
 assert.match(firmware, /tasks\["psramStackTasksCreated"\]/);
 assert.match(firmware, /tasks\["internalStackFallbacks"\]/);
+assert.match(firmware, /tasks\["internalSafetyTasks"\]/);
 assert.match(firmware, /void indexWorkerTask\([\s\S]{0,700}vTaskDeleteWithCaps\(NULL\)/);
 assert.match(firmware, /void storageMonitorTask\([\s\S]{0,500}vTaskDeleteWithCaps\(NULL\)/);
 assert.match(firmware, /void bootCoordinatorTask\([\s\S]{0,2500}vTaskDeleteWithCaps\(NULL\)/);

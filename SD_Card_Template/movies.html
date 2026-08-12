@@ -5,7 +5,7 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 
-<title>Nomad • Movies</title>
+<title>Nomad &bull; Movies</title>
 <link rel="stylesheet" href="/master.css">
 <script>
 (function(){
@@ -55,6 +55,13 @@
   .toolbar input[type="search"]{flex:1 1 220px;padding:.5rem .75rem;border:1px solid var(--line);border-radius:var(--radius);font-size:0.95rem;background:var(--card);color:var(--text)}
   .toolbar select, .toolbar .view-btn{padding:.48rem .7rem;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:var(--radius);font-size:0.9rem;cursor:pointer}
   .view-btn.active{background:var(--primary);color:var(--color-white);border-color:var(--primary-dark);}
+  .view-icon{display:grid;width:18px;height:18px;gap:2px;grid-template-columns:repeat(var(--cols),1fr);grid-template-rows:repeat(var(--rows),1fr)}
+  .view-icon::before,.view-icon::after{content:"";display:block;border:1px solid currentColor;box-sizing:border-box}
+  .view-icon::before{grid-column:1/-1;grid-row:1/-1}
+  .view-icon::after{grid-column:var(--marker-col);grid-row:var(--marker-row);background:currentColor}
+  .view-icon-small{--cols:3;--rows:3;--marker-col:2;--marker-row:2}
+  .view-icon-medium{--cols:2;--rows:2;--marker-col:2;--marker-row:2}
+  .view-icon-large{--cols:1;--rows:1;--marker-col:1;--marker-row:1}
 
   main{flex:1;display:flex;flex-direction:column;max-width:1200px;width:100%;margin:0 auto;padding:1rem}
   .grid-wrapper{flex:1;overflow-y:auto;padding-bottom:12px}
@@ -206,18 +213,18 @@
 <body data-page="movies">
   <header>
     <h1>Movies</h1>
-    <a class="back-btn" href="/menu">← Back to Menu</a>
+    <a class="back-btn" href="/menu">&larr; Back to Menu</a>
   </header>
 
   <div class="toolbar" role="region" aria-label="toolbar">
-    <input id="searchInput" type="search" placeholder="Search movies…" aria-label="Search movies">
+    <input id="searchInput" type="search" placeholder="Search movies&hellip;" aria-label="Search movies">
     <select id="sortSelect" aria-label="Sort movies">
-      <option value="nameAsc">A → Z</option>
-      <option value="nameDesc">Z → A</option>
+      <option value="nameAsc">A &rarr; Z</option>
+      <option value="nameDesc">Z &rarr; A</option>
     </select>
-    <button class="view-btn" data-size="small" title="Compact view" aria-pressed="false">🔳</button>
-    <button class="view-btn active" data-size="medium" title="Comfort view" aria-pressed="true">🔲</button>
-    <button class="view-btn" data-size="large" title="Gallery view" aria-pressed="false">⬜</button>
+    <button class="view-btn" data-size="small" title="Compact view" aria-label="Compact view" aria-pressed="false"><span class="view-icon view-icon-small" aria-hidden="true"></span></button>
+    <button class="view-btn active" data-size="medium" title="Comfort view" aria-label="Comfort view" aria-pressed="true"><span class="view-icon view-icon-medium" aria-hidden="true"></span></button>
+    <button class="view-btn" data-size="large" title="Gallery view" aria-label="Gallery view" aria-pressed="false"><span class="view-icon view-icon-large" aria-hidden="true"></span></button>
   </div>
 
   <main>
@@ -244,7 +251,7 @@
       <div class="video-container">
         <video id="videoPlayer" controls playsinline aria-label="Video player"></video>
       </div>
-      <button id="videoCloseBtn" class="close-btn" onclick="closeVideo()" aria-label="Close video">✕ Close</button>
+      <button id="videoCloseBtn" class="close-btn" onclick="closeVideo()" aria-label="Close video">&times; Close</button>
     </div>
   </div>
 
@@ -312,6 +319,13 @@ let rootSig = null;
 
 
 /* Helpers */
+function normalizePath(path){
+  if(!path) return '/';
+  let normalized = String(path).trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+  if(!normalized.startsWith('/')) normalized = '/' + normalized;
+  if(normalized.length > 1 && normalized.endsWith('/')) normalized = normalized.slice(0, -1);
+  return normalized;
+}
 function ext(name){ const i=name.lastIndexOf('.'); return i>=0? name.slice(i).toLowerCase() : ''; }
 function isVideoName(n){ return VIDEO_EXTS.includes(ext(n)); }
 function isImageName(n){ return IMAGE_EXTS.includes(ext(n)); }

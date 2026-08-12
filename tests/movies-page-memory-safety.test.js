@@ -20,6 +20,10 @@ assert.match(movies, /await ensurePlyrAssets\(\)/);
 assert.match(movies, /const COVER_LOAD_LIMIT = 1/);
 assert.match(movies, /data-src="\$\{item\.cover\}"/);
 assert.match(movies, /IntersectionObserver/);
+assert.match(movies, /function normalizePath\(path\)/,
+  'the initial library loader needs its path helper before deferred utilities load');
+assert.doesNotMatch(movies, /[^\x00-\x7F]/,
+  'Movies page must remain ASCII-safe across the device form-save path');
 assert.doesNotMatch(head, /src="\/theme-boot\.js"|src="\/nomad-utils\.js"|src="\/theme-manager\.js"/,
   'shared scripts must not fan out during the initial Movies request');
 assert.match(movies, /setTimeout\(loadThemeManagerLater, 5000\)/);

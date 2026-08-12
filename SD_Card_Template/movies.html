@@ -6,12 +6,20 @@
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 
 <title>Nomad • Movies</title>
-<link rel="stylesheet" href="assets/plyr.css" />
 <link rel="stylesheet" href="/master.css">
-<script src="/theme-boot.js"></script>
-<script src="/nomad-utils.js"></script>
-<script src="assets/plyr.min.js"></script>
-<script src="/theme-manager.js"></script>
+<script>
+(function(){
+  try {
+    if(localStorage.getItem('nomad_dark_mode') === 'true') document.documentElement.classList.add('dark');
+    const saved = localStorage.getItem('nomad_custom_theme');
+    if(!saved) return;
+    const c = JSON.parse(saved);
+    const style = document.createElement('style');
+    style.textContent = `:root{--primary:${c.primary}!important;--primary-dark:${c.primaryDark}!important;--bg:${c.bgLight}!important;--card:${c.cardLight}!important;--card-bg:${c.cardLight}!important;--text:${c.textLight}!important;--muted:${c.mutedLight}!important}body.dark{--bg:${c.bgDark}!important;--card:${c.cardDark}!important;--card-bg:${c.cardDark}!important;--text:${c.textDark}!important;--muted:${c.mutedDark}!important;--primary:${c.primaryDarkTheme}!important}`;
+    document.head.appendChild(style);
+  } catch(e) {}
+})();
+</script>
 
 <style>
   /* Functional CSS: Movies-specific layout and Plyr.js customization */
@@ -521,8 +529,99 @@ async function loadFromMediaJson(){
 
 /* Render grid with optional staggered animation on first load */
 const gridEl = document.getElementById('grid');
+const COVER_LOAD_LIMIT = 1;
+const coverLoadQueue = [];
+let activeCoverLoads = 0;
+
+function pumpCoverLoads(){
+  while(activeCoverLoads < COVER_LOAD_LIMIT && coverLoadQueue.length){
+    const img = coverLoadQueue.shift();
+    if(!img || !img.isConnected || !img.dataset.src) continue;
+    activeCoverLoads++;
+    const done = () => {
+      activeCoverLoads = Math.max(0, activeCoverLoads - 1);
+      pumpCoverLoads();
+    };
+    img.addEventListener('load', done, { once:true });
+    img.addEventListener('error', done, { once:true });
+    img.src = img.dataset.src;
+    delete img.dataset.src;
+  }
+}
+
+function queueCoverLoad(img){
+  if(!img || !img.dataset.src || img.dataset.queued === '1') return;
+  img.dataset.queued = '1';
+  coverLoadQueue.push(img);
+  pumpCoverLoads();
+}
+
+const coverObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if(!entry.isIntersecting) return;
+        coverObserver.unobserve(entry.target);
+        queueCoverLoad(entry.target);
+      });
+    }, { rootMargin:'300px 0px' })
+  : null;
+
+let plyrAssetsPromise = null;
+let nomadUtilsPromise = null;
+let themeManagerRequested = false;
+
+function loadScriptOnce(src, marker){
+  const existing = document.querySelector(`script[data-lazy="${marker}"]`);
+  if(existing) return existing.__ready || Promise.resolve();
+  const script = document.createElement('script');
+  script.src = src;
+  script.dataset.lazy = marker;
+  script.__ready = new Promise((resolve, reject) => {
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Unable to load ${src}`));
+  });
+  document.head.appendChild(script);
+  return script.__ready;
+}
+
+function ensureNomadUtils(){
+  if(window.NomadSubs && window.NomadUI) return Promise.resolve();
+  if(!nomadUtilsPromise) nomadUtilsPromise = loadScriptOnce('/nomad-utils.js', 'nomad-utils');
+  return nomadUtilsPromise;
+}
+
+function loadThemeManagerLater(){
+  if(themeManagerRequested) return;
+  themeManagerRequested = true;
+  loadScriptOnce('/theme-manager.js', 'theme-manager').catch(() => {});
+}
+
+function ensurePlyrAssets(){
+  if(window.Plyr) return Promise.resolve();
+  if(plyrAssetsPromise) return plyrAssetsPromise;
+  plyrAssetsPromise = new Promise((resolve, reject) => {
+    const loadPlyrScript = () => {
+      loadScriptOnce('/assets/plyr.min.js', 'plyr-script').then(resolve, reject);
+    };
+    const existing = document.querySelector('link[data-plyr-lazy]');
+    if(existing){
+      loadPlyrScript();
+      return;
+    }
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/assets/plyr.css';
+    link.dataset.plyrLazy = '1';
+    link.onload = loadPlyrScript;
+    link.onerror = () => reject(new Error('Unable to load video controls'));
+    document.head.appendChild(link);
+  });
+  return plyrAssetsPromise;
+}
 
 function renderGrid(){
+  coverLoadQueue.length = 0;
+  if(coverObserver) coverObserver.disconnect();
   gridEl.className = `media-grid ${currentSize}`;
   const frag = document.createDocumentFragment();
 
@@ -534,7 +633,7 @@ function renderGrid(){
 
     const saved = findResume(item);
     const resumeHTML = (saved && saved.entry && saved.entry.position > 1) ? `<div class="badge-resume" style="background:rgba(0,0,0,0.6);color:#fff;">${formatTime(saved.entry.position)}</div>` : '';
-    const imgHTML = item.cover ? `<img class="media-thumb" loading="lazy" src="${item.cover}" alt="${escapeHtml(item.name)}">` : '';
+    const imgHTML = item.cover ? `<img class="media-thumb" data-src="${item.cover}" alt="${escapeHtml(item.name)}">` : '';
     card.innerHTML = `
       <div class="thumb-wrapper">
         <span class="fallback-text">${escapeHtml(item.name)}</span>
@@ -557,6 +656,10 @@ function renderGrid(){
   // Clear + append
   gridEl.innerHTML = '';
   gridEl.appendChild(frag);
+  gridEl.querySelectorAll('img[data-src]').forEach(img => {
+    if(coverObserver) coverObserver.observe(img);
+    else queueCoverLoad(img);
+  });
 
   // Decide if we should animate now:
   const animKey = rootSig ? `${ANIM_KEY_BASE}:${rootSig}` : ANIM_KEY_BASE;
@@ -784,6 +887,8 @@ function startStallWatcher(player, src){
 async function openVideo(src, useResume=false){
   clearTimeout(stallTimer);
   stallRetries = 0;
+  await ensureNomadUtils();
+  await ensurePlyrAssets();
 
   console.log('[openVideo] currentMovie:', currentMovie ? currentMovie.path : 'NONE', 'useResume:', useResume);
   const saved = findResume(currentMovie || { path: '' });
@@ -1205,10 +1310,12 @@ window.addEventListener('hashchange', ()=> handleHashNavigation(getHashParam()))
     console.error('init error', e);
   }
   setInterval(checkIndex, 30000);
+  setTimeout(loadThemeManagerLater, 5000);
+  setTimeout(() => {
+    ensureNomadUtils().then(() => NomadUI.hideDownloads('downloadButton')).catch(() => {});
+  }, 2500);
 })();
 
-/* admin toggle: hide the download action when downloads are disabled */
-NomadUI.hideDownloads('downloadButton');
 </script>
 </body>
 </html>

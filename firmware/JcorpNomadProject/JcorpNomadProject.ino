@@ -586,6 +586,9 @@ bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
 void printJsonEscapedTo(Print &out, const String &value);
 bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
                        const std::shared_ptr<PsramResponseBuffer> &body);
+bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
+                       const std::shared_ptr<PsramResponseBuffer> &body,
+                       const char *cacheControl);
 const char* resetReasonName(esp_reset_reason_t reason);
 void initRestartDiagnostics();
 void updateRestartSnapshot(const char *operation);
@@ -878,7 +881,8 @@ void printJsonEscapedTo(Print &out, const String &value) {
 }
 
 bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
-                       const std::shared_ptr<PsramResponseBuffer> &body) {
+                       const std::shared_ptr<PsramResponseBuffer> &body,
+                       const char *cacheControl) {
   if (!body || !body->data || body->overflow) return false;
   AwsResponseFiller filler = [body](uint8_t *destination, size_t maxLen, size_t index) -> size_t {
     if (index >= body->length) return 0;
@@ -888,9 +892,14 @@ bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
   };
   AsyncWebServerResponse *response = request->beginResponse(contentType, body->length, filler);
   if (!response) return false;
-  response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Cache-Control", cacheControl);
   request->send(response);
   return true;
+}
+
+bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
+                       const std::shared_ptr<PsramResponseBuffer> &body) {
+  return sendPsramResponse(request, contentType, body, "no-store");
 }
 
 const char* resetReasonName(esp_reset_reason_t reason) {
@@ -5909,6 +5918,18 @@ bool shouldBufferSdAsset(const String &path) {
 }
 
 bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, const String &mime) {
+  if (ESP.getFreeHeap() < HEALTH_LOW_HEAP_RESTART_BYTES ||
+      ESP.getMaxAllocHeap() < HEALTH_LOW_LARGEST_BLOCK_BYTES) {
+    AsyncWebServerResponse *busy = request->beginResponse(
+      503, "text/plain", "Server memory busy; retry shortly");
+    if (busy) {
+      busy->addHeader("Retry-After", "1");
+      busy->addHeader("Cache-Control", "no-store");
+      request->send(busy);
+    }
+    return true;
+  }
+
   if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
     request->send(503, "text/plain", "SD busy");
     return true;
@@ -5921,10 +5942,36 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, 
     return false;
   }
 
-  // Static UI assets are often 20-80 KB. Buffering them into an Arduino String
-  // can consume more heap than the running web server has available, causing
-  // timeouts and fragmentation. Validate the file under sdMutex, then let the
-  // async response stream it from SD instead of copying it into heap.
+  const size_t fileSize = file.size();
+  static constexpr size_t MAX_PSRAM_UI_ASSET_BYTES = 256 * 1024;
+  if (fileSize > 0 && fileSize <= MAX_PSRAM_UI_ASSET_BYTES) {
+    std::shared_ptr<PsramResponseBuffer> body =
+      std::make_shared<PsramResponseBuffer>(fileSize);
+    if (body && body->data) {
+      while (body->length < fileSize) {
+        size_t count = file.read(body->data + body->length, fileSize - body->length);
+        if (!count) break;
+        body->length += count;
+      }
+      file.close();
+      if (sdMutex) xSemaphoreGive(sdMutex);
+      if (body->length != fileSize) {
+        request->send(503, "text/plain", "Unable to read UI asset");
+        return true;
+      }
+      String lower = filePath;
+      lower.toLowerCase();
+      const char *cacheControl = lower.endsWith(".html")
+        ? "no-cache" : "public, max-age=600";
+      if (!sendPsramResponse(request, mime.c_str(), body, cacheControl)) {
+        request->send(503, "text/plain", "Unable to serve UI asset");
+      }
+      return true;
+    }
+  }
+
+  // Large files retain the SD streaming path. UI pages and their normal assets
+  // use PSRAM above so concurrent browser startup requests do not consume heap.
   file.close();
   AsyncWebServerResponse *response = request->beginResponse(SD_MMC, filePath, mime);
   if (sdMutex) xSemaphoreGive(sdMutex);
@@ -5933,7 +5980,7 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, 
     return true;
   }
   response->addHeader("Accept-Ranges", "bytes");
-  response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Cache-Control", "public, max-age=600");
   request->send(response);
   return true;
 }
@@ -6747,7 +6794,8 @@ Serial.println("SD Card initialized successfully!");
 
             // ex-serveStatic buckets: route them through handleRangeRequest so reads
             // stay under sdMutex. Only these two - root pages must serve during indexing.
-            if (url.startsWith("/Gallery/") || url.startsWith("/Files/")) {
+            if (url.startsWith("/Gallery/") || url.startsWith("/Files/") ||
+                url.startsWith("/Movies/")) {
                 handleRangeRequest(request);
                 return;
             }
@@ -7498,6 +7546,7 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   tasks["lastStreamIoAgeMs"] = lastStreamIoMs > 0 ? nowMs - lastStreamIoMs : 0;
   tasks["psramStackTasksCreated"] = backgroundPsramTaskCount;
   tasks["internalStackFallbacks"] = backgroundInternalTaskCount;
+  tasks["internalSafetyTasks"] = 1;
 
   JsonObject http = doc.createNestedObject("http");
   http["debugPingCount"] = httpDebugPingCount;
@@ -8637,7 +8686,9 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
       webLog("[SYSTEM] Failed to start streaming task", "error");
     }
 
-    t = createBackgroundTask(+[](void *param){
+    // This task writes restart intent to NVS during a heap emergency. Its stack
+    // must remain internal because flash writes can temporarily disable PSRAM.
+    t = xTaskCreatePinnedToCore(+[](void *param){
       (void)param;
       unsigned long lastLogMs = 0;
       unsigned long lastSampleMs = 0;
@@ -8746,7 +8797,7 @@ attachInterrupt(BOOT_BUTTON_PIN, [](){
 
         vTaskDelay(pdMS_TO_TICKS(1000));
       }
-      vTaskDeleteWithCaps(NULL);
+      vTaskDelete(NULL);
     }, "HttpHealth", 3 * 1024, NULL, 1, NULL, 0);
     if (t == pdPASS) {
       webLog("[SYSTEM] HTTP health watchdog started", "success");

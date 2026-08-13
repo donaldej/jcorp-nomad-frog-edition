@@ -222,6 +222,9 @@ static void closeStreamById(uint32_t streamId) {
 static uint64_t cachedTotalBytes = 0;
 static uint64_t cachedUsedBytes = 0;
 static bool g_sdStatTrusted = false;
+static uint8_t sdBusWidth = 0;
+static uint32_t sdBusFrequencyKhz = 0;
+static const char *sdMountProfile = "unmounted";
 const char* SD_USAGE_FILE = "/.system-index/sd_usage.json";
 static unsigned long lastScanTime = 0;
 volatile bool sdbarDirty = false;
@@ -2003,6 +2006,48 @@ bool deleteRecursive(String path) {
 volatile bool sdErrorFlag            = false;      
 unsigned long sdErrorCooldownUntil   = 0;          
 
+bool mountSDCardWithFallback() {
+    struct SdMountAttempt {
+        bool mode1bit;
+        int frequencyKhz;
+        uint8_t busWidth;
+        const char *profile;
+    };
+
+    static const SdMountAttempt attempts[] = {
+        { false, SDMMC_FREQ_HIGHSPEED, 4, "4-bit high-speed" },
+        { false, SDMMC_FREQ_DEFAULT,   4, "4-bit default-speed" },
+        { true,  SDMMC_FREQ_DEFAULT,   1, "1-bit compatibility" }
+    };
+
+    sdBusWidth = 0;
+    sdBusFrequencyKhz = 0;
+    sdMountProfile = "unmounted";
+
+    for (const auto &attempt : attempts) {
+        Serial.printf("[SD] Mount attempt: %s (%u-bit, %d kHz)\n",
+                      attempt.profile, (unsigned)attempt.busWidth,
+                      attempt.frequencyKhz);
+        if (SD_MMC.begin("/sdcard", attempt.mode1bit, false,
+                         attempt.frequencyKhz, 12) &&
+            SD_MMC.cardType() != CARD_NONE) {
+            sdBusWidth = attempt.busWidth;
+            sdBusFrequencyKhz = (uint32_t)attempt.frequencyKhz;
+            sdMountProfile = attempt.profile;
+            Serial.printf("[SD] Mounted with %s; sector=%d bytes\n",
+                          sdMountProfile, SD_MMC.sectorSize());
+            return true;
+        }
+
+        Serial.printf("[SD] Mount failed: %s\n", attempt.profile);
+        SD_MMC.end();
+        delay(150);
+    }
+
+    Serial.println("[SD] All mount profiles failed");
+    return false;
+}
+
 bool tryRecoverSDCard() {
     Serial.println("[SD] Attempting recovery…");
 
@@ -2016,7 +2061,7 @@ bool tryRecoverSDCard() {
 
         SD_MMC.end();          // unmount
         delay(1000);           // give hardware a breather
-        bool ok = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 12);
+        bool ok = mountSDCardWithFallback();
 
         if (sdHeld && sdMutex) xSemaphoreGive(sdMutex);
         xSemaphoreGive(streamingFilesMutex);
@@ -2030,7 +2075,7 @@ bool tryRecoverSDCard() {
     if (!sdTaken) Serial.println("[SD] Recovery: sdMutex timeout, remounting without it.");
     SD_MMC.end();
     delay(1000);
-    bool ok = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 12);
+    bool ok = mountSDCardWithFallback();
     if (sdTaken && sdMutex) xSemaphoreGive(sdMutex);
     Serial.println(ok ? "[SD] Recovery OK." : "[SD] Recovery failed.");
     return ok;
@@ -6179,7 +6224,7 @@ if (!SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_
     return;
 }
 
-if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 12)) {
+if (!mountSDCardWithFallback()) {
     Serial.println("ERROR: SDMMC Card initialization failed.");
     return;
 }
@@ -7576,6 +7621,9 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   sd["cachedUsed"] = cachedUsedBytes;
   sd["statTrusted"] = g_sdStatTrusted;
   sd["scanInProgress"] = sdScanInProgress;
+  sd["busWidth"] = sdBusWidth;
+  sd["frequencyKhz"] = sdBusFrequencyKhz;
+  sd["mountProfile"] = sdMountProfile;
 
   JsonObject tasks = doc.createNestedObject("tasks");
   tasks["indexingInProgress"] = indexingInProgress;

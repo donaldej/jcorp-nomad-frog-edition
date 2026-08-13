@@ -50,6 +50,8 @@ void applyRGBSettings();
 String sanitizeToken(const String &s);
 bool saveSettings();
 String humanSize(size_t bytes);
+bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath,
+                        const String &mime, size_t maxPsramBytes = 256UL * 1024UL);
 void launch_usb_mode() {
 extern void usb_setup();
 extern void usb_loop();
@@ -198,11 +200,29 @@ struct StreamHandle {
   String path;
   unsigned long lastActivity;
   size_t lastEndByte;
+  bool auxiliary;
 };
 static std::map<uint32_t, StreamHandle> streamingFiles;
 static SemaphoreHandle_t streamingFilesMutex = NULL;
-static const int MAX_CONCURRENT_STREAMS = 1;
+static const int MAX_CONCURRENT_PRIMARY_STREAMS = 1;
+static const int MAX_CONCURRENT_AUXILIARY_STREAMS = 1;
+static const int MAX_CONCURRENT_STREAMS = 2;
+static const size_t MAX_AUXILIARY_ASSET_BYTES = 2UL * 1024UL * 1024UL;
 volatile int activeStreams = 0;
+volatile int activePrimaryStreams = 0;
+volatile int activeAuxiliaryStreams = 0;
+
+static void updateActiveStreamCountsLocked() {
+  int primary = 0;
+  int auxiliary = 0;
+  for (const auto &entry : streamingFiles) {
+    if (entry.second.auxiliary) auxiliary++;
+    else primary++;
+  }
+  activeStreams = primary + auxiliary;
+  activePrimaryStreams = primary;
+  activeAuxiliaryStreams = auxiliary;
+}
 
 // close a handle we opened but never sent, so it doesn't leak until the LRU gets it
 static void closeStreamById(uint32_t streamId) {
@@ -214,7 +234,7 @@ static void closeStreamById(uint32_t streamId) {
   if (it != streamingFiles.end()) {
     it->second.file.close();
     streamingFiles.erase(it);
-    activeStreams = streamingFiles.size();
+    updateActiveStreamCountsLocked();
   }
   if (streamingFilesMutex) xSemaphoreGive(streamingFilesMutex);
 }
@@ -2057,7 +2077,7 @@ bool tryRecoverSDCard() {
         bool sdHeld = (!sdMutex) || (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE);
         for (auto &kv : streamingFiles) kv.second.file.close();
         streamingFiles.clear();
-        activeStreams = 0;
+        updateActiveStreamCountsLocked();
 
         SD_MMC.end();          // unmount
         delay(1000);           // give hardware a breather
@@ -2556,11 +2576,28 @@ String contentTypeForPath(const String &filePath, bool *isMediaStream = nullptr)
   else if (lowerPath.endsWith(".m4v")) { contentType = "video/x-m4v"; media = true; }
   else if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")) contentType = "image/jpeg";
   else if (lowerPath.endsWith(".png")) contentType = "image/png";
+  else if (lowerPath.endsWith(".webp")) contentType = "image/webp";
+  else if (lowerPath.endsWith(".gif")) contentType = "image/gif";
+  else if (lowerPath.endsWith(".avif")) contentType = "image/avif";
+  else if (lowerPath.endsWith(".vtt")) contentType = "text/vtt";
+  else if (lowerPath.endsWith(".srt")) contentType = "application/x-subrip";
+  else if (lowerPath.endsWith(".json")) contentType = "application/json";
+  else if (lowerPath.endsWith(".ndjson")) contentType = "application/x-ndjson";
   else if (lowerPath.endsWith(".cbz")) contentType = "application/vnd.comicbook+zip";
   else if (lowerPath.endsWith(".cbr")) contentType = "application/vnd.comicbook-rar";
 
   if (isMediaStream) *isMediaStream = media;
   return contentType;
+}
+
+bool isAuxiliaryAssetPath(const String &filePath) {
+  String lowerPath = filePath;
+  lowerPath.toLowerCase();
+  return lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg") ||
+         lowerPath.endsWith(".png") || lowerPath.endsWith(".webp") ||
+         lowerPath.endsWith(".gif") || lowerPath.endsWith(".avif") ||
+         lowerPath.endsWith(".vtt") || lowerPath.endsWith(".srt") ||
+         lowerPath.endsWith(".json") || lowerPath.endsWith(".ndjson");
 }
 
 bool parseByteRange(const String &rangeHeader, size_t fileSize, size_t &startByte, size_t &endByte) {
@@ -2656,6 +2693,8 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
   size_t fileSize = file.size();
   bool isMediaStream = false;
   String mimeType = contentTypeForPath(filePath, &isMediaStream);
+  bool isAuxiliaryAsset = isAuxiliaryAssetPath(filePath) &&
+                          fileSize <= MAX_AUXILIARY_ASSET_BYTES;
 
   if (request->method() == HTTP_HEAD) {
     AsyncWebServerResponse *headResponse = request->beginResponse(200, mimeType, "");
@@ -2688,6 +2727,20 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     return;
   }
   size_t contentLength = endByte - startByte + 1;
+
+  // Posters and small metadata do not need a seekable SD handle. Copying them
+  // into PSRAM lets the SD file close before AsyncTCP sends the response, so
+  // they cannot consume the primary playback slot or hold the SD bus between
+  // network packets.
+  if (isAuxiliaryAsset && rangeHeader.length() == 0) {
+    bool sdTaken = (!sdMutex) || (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE);
+    file.close();
+    if (sdTaken && sdMutex) xSemaphoreGive(sdMutex);
+    if (!sendBufferedSdFile(request, filePath, mimeType, MAX_AUXILIARY_ASSET_BYTES)) {
+      request->send(404, "text/plain", "File not found");
+    }
+    return;
+  }
 
   String pLower = filePath;
   pLower.toLowerCase();
@@ -2740,13 +2793,20 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
       }
     }
 
-    if ((int)streamingFiles.size() >= MAX_CONCURRENT_STREAMS) {
-      Serial.printf("[Stream] Limit reached for %s (active=%d heap=%u)\n",
-                    filePath.c_str(), activeStreams, (unsigned)ESP.getFreeHeap());
+    updateActiveStreamCountsLocked();
+    bool classLimitReached = isAuxiliaryAsset
+      ? activeAuxiliaryStreams >= MAX_CONCURRENT_AUXILIARY_STREAMS
+      : activePrimaryStreams >= MAX_CONCURRENT_PRIMARY_STREAMS;
+    if ((int)streamingFiles.size() >= MAX_CONCURRENT_STREAMS || classLimitReached) {
+      Serial.printf("[Stream] Limit reached for %s (primary=%d auxiliary=%d heap=%u)\n",
+                    filePath.c_str(), activePrimaryStreams, activeAuxiliaryStreams,
+                    (unsigned)ESP.getFreeHeap());
       if (sdMutex) xSemaphoreGive(sdMutex);
       xSemaphoreGive(streamingFilesMutex);
       AsyncWebServerResponse *busy = request->beginResponse(
-        503, "text/plain", "Too many active media requests; retry shortly");
+        503, "text/plain", isAuxiliaryAsset
+          ? "Auxiliary asset request busy; retry shortly"
+          : "Too many active media requests; retry shortly");
       if (busy) {
         busy->addHeader("Retry-After", "2");
         request->send(busy);
@@ -2772,10 +2832,12 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     sh.path = filePath;
     sh.lastActivity = millis();
     sh.lastEndByte = endByte;
+    sh.auxiliary = isAuxiliaryAsset;
     streamingFiles[streamId] = sh;
-    activeStreams = streamingFiles.size();
-    Serial.printf("[Stream] New #%u at %lu: %s (active=%d heap=%u)\n",
-                  streamId, (unsigned long)startByte, filePath.c_str(), activeStreams,
+    updateActiveStreamCountsLocked();
+    Serial.printf("[Stream] New #%u at %lu: %s (primary=%d auxiliary=%d heap=%u)\n",
+                  streamId, (unsigned long)startByte, filePath.c_str(),
+                  activePrimaryStreams, activeAuxiliaryStreams,
                   (unsigned)ESP.getFreeHeap());
     if (sdMutex) xSemaphoreGive(sdMutex);
     xSemaphoreGive(streamingFilesMutex);
@@ -2788,7 +2850,7 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
   AsyncWebServerResponse *response = request->beginResponse(
     mimeType,
     contentLength,
-    [streamId, filePath, startByte, contentLength](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+    [streamId, filePath, startByte, contentLength, isAuxiliaryAsset](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
       // busy mutex isnt end-of-data: returning 0 truncates the response, TRY_AGAIN retries later
       if (streamingFilesMutex && xSemaphoreTake(streamingFilesMutex, pdMS_TO_TICKS(150)) != pdTRUE) {
         return RESPONSE_TRY_AGAIN;
@@ -2817,8 +2879,9 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
         sh.path = filePath;
         sh.lastActivity = millis();
         sh.lastEndByte = startByte + index;
+        sh.auxiliary = isAuxiliaryAsset;
         streamingFiles[streamId] = sh;
-        activeStreams = streamingFiles.size();
+        updateActiveStreamCountsLocked();
         if (sdMutex) xSemaphoreGive(sdMutex);
         Serial.printf("[Stream] Reopened #%u at %lu (evicted mid-send): %s\n",
                       streamId, (unsigned long)(startByte + index), filePath.c_str());
@@ -2846,7 +2909,7 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
       if (finished) {
         file.close();
         streamingFiles.erase(it);
-        activeStreams = streamingFiles.size();
+        updateActiveStreamCountsLocked();
       }
       xSemaphoreGive(streamingFilesMutex);
 
@@ -5861,7 +5924,7 @@ void checkStreamingTimeout() {
           }
         }
         if (closed > 0) {
-          activeStreams = streamingFiles.size();
+          updateActiveStreamCountsLocked();
           Serial.printf("[StreamCleanup] Closed %d idle, %d active\n", closed, activeStreams);
         }
       }
@@ -6008,7 +6071,8 @@ bool shouldBufferSdAsset(const String &path) {
          lower.endsWith(".json") || lower.endsWith(".svg");
 }
 
-bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, const String &mime) {
+bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath,
+                        const String &mime, size_t maxPsramBytes) {
   if (ESP.getFreeHeap() < HEALTH_LOW_HEAP_RESTART_BYTES ||
       ESP.getMaxAllocHeap() < HEALTH_LOW_LARGEST_BLOCK_BYTES) {
     AsyncWebServerResponse *busy = request->beginResponse(
@@ -6034,8 +6098,7 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, 
   }
 
   const size_t fileSize = file.size();
-  static constexpr size_t MAX_PSRAM_UI_ASSET_BYTES = 256 * 1024;
-  if (fileSize > 0 && fileSize <= MAX_PSRAM_UI_ASSET_BYTES) {
+  if (fileSize > 0 && fileSize <= maxPsramBytes) {
     std::shared_ptr<PsramResponseBuffer> body =
       std::make_shared<PsramResponseBuffer>(fileSize);
     if (body && body->data) {
@@ -6053,7 +6116,8 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath, 
       String lower = filePath;
       lower.toLowerCase();
       const char *cacheControl = lower.endsWith(".html")
-        ? "no-cache" : "public, max-age=600";
+        ? "no-cache" : (isAuxiliaryAssetPath(lower)
+          ? "public, max-age=86400" : "public, max-age=600");
       if (!sendPsramResponse(request, mime.c_str(), body, cacheControl)) {
         request->send(503, "text/plain", "Unable to serve UI asset");
       }
@@ -7532,8 +7596,12 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
 
   int queueDepth = indexQueue ? uxQueueMessagesWaiting(indexQueue) : 0;
   int streamCount = activeStreams;
+  int primaryStreamCount = activePrimaryStreams;
+  int auxiliaryStreamCount = activeAuxiliaryStreams;
   if (streamingFilesMutex && xSemaphoreTake(streamingFilesMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     streamCount = streamingFiles.size();
+    primaryStreamCount = activePrimaryStreams;
+    auxiliaryStreamCount = activeAuxiliaryStreams;
     xSemaphoreGive(streamingFilesMutex);
   }
 
@@ -7638,6 +7706,8 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   tasks["totalBuckets"] = totalBuckets;
   tasks["indexProgressPercent"] = indexPercent;
   tasks["activeStreams"] = streamCount;
+  tasks["activePrimaryStreams"] = primaryStreamCount;
+  tasks["activeAuxiliaryStreams"] = auxiliaryStreamCount;
   tasks["mediaStreamingActive"] = mediaStreamingActive;
   tasks["lastStreamIoAgeMs"] = lastStreamIoMs > 0 ? nowMs - lastStreamIoMs : 0;
   tasks["psramStackTasksCreated"] = backgroundPsramTaskCount;

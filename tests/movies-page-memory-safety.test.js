@@ -29,7 +29,8 @@ assert.doesNotMatch(head, /src="\/theme-boot\.js"|src="\/nomad-utils\.js"|src="\
 assert.match(movies, /setTimeout\(loadThemeManagerLater, 5000\)/);
 assert.match(movies, /await ensureNomadUtils\(\)[\s\S]{0,80}await ensurePlyrAssets\(\)/);
 
-assert.match(firmware, /MAX_PSRAM_UI_ASSET_BYTES = 256 \* 1024/);
+assert.match(firmware, /size_t maxPsramBytes = 256UL \* 1024UL/,
+  'normal UI assets should retain the existing 256 KiB PSRAM default');
 assert.match(firmware, /sendPsramResponse\(request, mime\.c_str\(\), body, cacheControl\)/);
 assert.match(firmware, /ESP\.getFreeHeap\(\) < HEALTH_LOW_HEAP_RESTART_BYTES/);
 assert.match(firmware, /busy->addHeader\("Retry-After", "1"\)/);

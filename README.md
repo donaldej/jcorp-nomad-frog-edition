@@ -105,6 +105,7 @@ If you just want to support the project, donations are always appreciated:
 - **Build Identity:** Firmware and Admin UI build identifiers make it clear which version is running. Firmware builds also select a different LED color as a visible update indicator.
 - **Media Stability:** Large-index loading, movie-page memory use, HTTP byte-range handling, and SD access have been hardened to reduce freezes and reboots.
 - **Faster SD Access:** Supported boards negotiate 4-bit high-speed SDMMC at boot, with automatic default-speed and 1-bit compatibility fallbacks.
+- **Responsive Artwork During Playback:** Posters, subtitles, and small sidecar metadata use a bounded PSRAM-backed response path so library UI requests do not consume the primary media-stream slot.
 
 ### Default Themes (28)
 
@@ -282,6 +283,7 @@ removes the temporary file.
    - Correct HTTP byte-range responses for reliable seeking and browser playback.
    - Memory-safe movie index loading and PSRAM-backed background task stacks.
    - 4-bit high-speed SDMMC mounting with safe fallbacks and live bus diagnostics.
+   - A separate bounded auxiliary response path keeps artwork and metadata available during playback.
    - A single active media-request limit prevents the concurrent-stream freezes seen on this hardware.
 
 6. **Improved Library Support**

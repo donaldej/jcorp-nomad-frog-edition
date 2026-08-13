@@ -305,6 +305,13 @@
       <h2>Import Target</h2>
       <div class="grid">
         <div class="form-group">
+          <label for="import-mode">Import Format</label>
+          <select id="import-mode">
+            <option value="web" selected>Web compatible</option>
+            <option value="original">Original file</option>
+          </select>
+        </div>
+        <div class="form-group">
           <label for="dest-dir">Nomad Folder</label>
           <input id="dest-dir" type="text" placeholder="/Movies/Movie Name (2024)">
         </div>
@@ -365,6 +372,7 @@
       items: document.getElementById('items'),
       destDir: document.getElementById('dest-dir'),
       filename: document.getElementById('filename'),
+      importMode: document.getElementById('import-mode'),
       startImport: document.getElementById('start-import'),
       selectedMessage: document.getElementById('selected-message'),
       progressBar: document.getElementById('progress-bar'),
@@ -450,7 +458,7 @@
     function targetFor(video) {
       const type = video.type;
       const part = bestPart(video);
-      const ext = extFromPart(part);
+      const ext = els.importMode.value === 'web' ? '.mkv' : extFromPart(part);
       if (type === 'episode') {
         const show = cleanName(video.grandparentTitle);
         const season = Number(video.parentIndex || 0);
@@ -508,7 +516,12 @@
       els.destDir.value = target.dir;
       els.filename.value = target.filename;
       els.startImport.disabled = false;
-      els.selectedMessage.textContent = `Selected: ${item.title || item.grandparentTitle || 'Plex item'}`;
+      const media = asArray(item.Media)[0] || {};
+      const source = [media.videoCodec, media.audioCodec, media.container].filter(Boolean).join(' / ');
+      const mode = els.importMode.value === 'web'
+        ? 'Plex will convert audio for browser playback.'
+        : 'Original codecs may not play in every browser.';
+      els.selectedMessage.textContent = `Selected: ${item.title || item.grandparentTitle || 'Plex item'}${source ? ` - ${source}` : ''}. ${mode}`;
       renderItems();
     }
 
@@ -676,6 +689,8 @@
       const target = targetFor(selected);
       const payload = {
         partKey: part.key,
+        ratingKey: selected.ratingKey,
+        importMode: els.importMode.value,
         destDir: els.destDir.value.trim() || target.dir,
         filename: els.filename.value.trim() || target.filename,
         label: selected.title || selected.grandparentTitle || 'Plex item',
@@ -772,6 +787,9 @@
     els.loadItems.addEventListener('click', () => loadItems().catch(e => { els.items.innerHTML = `<div class="muted">${e.message}</div>`; }));
     els.loadEpisodes.addEventListener('click', () => loadEpisodes().catch(e => { els.items.innerHTML = `<div class="muted">${e.message}</div>`; }));
     els.filter.addEventListener('input', renderItems);
+    els.importMode.addEventListener('change', () => {
+      if (selected) selectItem(selected);
+    });
     els.startImport.addEventListener('click', () => startImport().catch(e => { els.progressMessage.textContent = e.message; }));
     els.clearHistory.addEventListener('click', () => queueAction('clear').catch(e => { els.progressMessage.textContent = e.message; }));
     els.syncSourceType.addEventListener('change', updateSyncSourceControls);

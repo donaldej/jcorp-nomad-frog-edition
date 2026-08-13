@@ -443,6 +443,8 @@ struct PlexImportState {
 struct PlexImportJob {
   uint32_t id = 0;
   String partKey;
+  String ratingKey;
+  String importMode = "original";
   String destDir;
   String filename;
   String label;
@@ -465,6 +467,8 @@ struct PlexImportJob {
 };
 
 bool appendPlexSyncManifest(const PlexImportJob *job, uint64_t size);
+String plexQueryEncode(const String &value);
+String plexImportUrl(const PlexImportJob *job);
 
 struct PlexTransferPipeline {
   File *out = nullptr;
@@ -4199,6 +4203,39 @@ bool plexConfigured() {
   return plexBaseUrl().length() > 0 && settings.plexToken.length() > 0;
 }
 
+String plexQueryEncode(const String &value) {
+  static const char hex[] = "0123456789ABCDEF";
+  String encoded;
+  encoded.reserve(value.length() * 3);
+  for (size_t i = 0; i < value.length(); i++) {
+    uint8_t c = static_cast<uint8_t>(value.charAt(i));
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += static_cast<char>(c);
+    } else {
+      encoded += '%';
+      encoded += hex[c >> 4];
+      encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
+}
+
+String plexImportUrl(const PlexImportJob *job) {
+  if (!job || job->importMode != "web" || !job->ratingKey.length()) {
+    return plexUrlForPath(job ? job->partKey + "?download=1" : "");
+  }
+  String path = "/video/:/transcode/universal/start.mp4";
+  path += "?path=" + plexQueryEncode("/library/metadata/" + job->ratingKey);
+  path += "&mediaIndex=0&partIndex=0&protocol=http&directPlay=0&directStream=1";
+  path += "&videoQuality=100&videoResolution=1280x720&maxVideoBitrate=8000";
+  path += "&audioBoost=100&location=lan";
+  path += "&session=nomad-" + String(job->id) + "-" + String(millis());
+  path += "&X-Plex-Client-Identifier=jcorp-nomad&X-Plex-Product=Jcorp%20Nomad";
+  path += "&X-Plex-Version=1.0&X-Plex-Platform=Chrome";
+  return plexUrlForPath(path);
+}
+
 void setPlexImportState(bool active, bool success, uint64_t downloaded, uint64_t total,
                         const String &label, const String &destPath, const String &message) {
   bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
@@ -4285,6 +4322,8 @@ bool persistPlexImportQueue() {
       StaticJsonDocument<1536> doc;
       doc["id"] = job->id;
       doc["partKey"] = job->partKey;
+      doc["ratingKey"] = job->ratingKey;
+      doc["importMode"] = job->importMode;
       doc["destDir"] = job->destDir;
       doc["filename"] = job->filename;
       doc["label"] = job->label;
@@ -4342,6 +4381,9 @@ void loadPlexImportQueue() {
     if (!job) break;
     job->id = doc["id"] | plexImportNextId;
     job->partKey = doc["partKey"] | "";
+    job->ratingKey = doc["ratingKey"] | "";
+    job->importMode = doc["importMode"] | "original";
+    if (job->importMode != "web") job->importMode = "original";
     job->destDir = doc["destDir"] | "";
     job->filename = doc["filename"] | "";
     job->label = doc["label"] | job->filename;
@@ -4633,13 +4675,10 @@ bool runPlexSyncOnce(bool allowDisabled = false) {
     int backslash = sourceFile.lastIndexOf('\\');
     int separator = max(slash, backslash);
     String originalName = separator >= 0 ? sourceFile.substring(separator + 1) : sourceFile;
-    int dot = originalName.lastIndexOf('.');
-    String extension = dot >= 0 ? originalName.substring(dot + 1) : String(part["container"] | "mp4");
-    extension = plexSyncSafeName(extension);
     String title = plexSyncSafeName(String(item["title"] | "Plex Item"));
     int year = item["year"] | 0;
     if (year > 0) title += " (" + String(year) + ")";
-    String filename = title + " [plex-" + ratingKey + "]." + extension;
+    String filename = title + " [plex-" + ratingKey + "].mkv";
     if (!validateUploadFilename(filename, pathError)) continue;
     String destPath = destDir + "/" + filename;
     if (SD_MMC.exists(destPath)) continue;
@@ -4663,6 +4702,8 @@ bool runPlexSyncOnce(bool allowDisabled = false) {
     }
     job->id = plexImportNextId++;
     job->partKey = partKey;
+    job->ratingKey = ratingKey;
+    job->importMode = "web";
     job->destDir = destDir;
     job->filename = filename;
     job->label = String("Plex Sync: ") + title;
@@ -5080,17 +5121,19 @@ void plexImportTask(void *pvParameters) {
         if (sdMutex) xSemaphoreGive(sdMutex);
         for (int requestAttempt = 0; requestAttempt < 2 && message.length() == 0; requestAttempt++) {
           uint64_t resumeOffset = 0;
+          bool resumable = job->importMode == "original";
           bool fileReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
           File out;
           if (fileReady) {
-            if (SD_MMC.exists(tempPath)) {
+            if (!resumable && SD_MMC.exists(tempPath)) SD_MMC.remove(tempPath);
+            if (resumable && SD_MMC.exists(tempPath)) {
               File partial = SD_MMC.open(tempPath, FILE_READ);
               if (partial) {
                 resumeOffset = partial.size();
                 partial.close();
               }
             }
-            if (resumeOffset > 0) {
+            if (resumable && resumeOffset > 0) {
               out = SD_MMC.open(tempPath, "r+");
               if (out && !out.seek(resumeOffset, SeekSet)) {
                 out.close();
@@ -5114,18 +5157,18 @@ void plexImportTask(void *pvParameters) {
           http.setReuse(true);
           const char* headers[] = { "Content-Length", "Content-Range" };
           http.collectHeaders(headers, 2);
-          String url = plexUrlForPath(job->partKey + "?download=1");
+          String url = plexImportUrl(job);
           if (!http.begin(client, url)) {
             message = "Failed to open Plex URL";
             out.close();
             break;
           }
           http.addHeader("Accept-Encoding", "identity");
-          if (resumeOffset > 0) {
+          if (resumable && resumeOffset > 0) {
             http.addHeader("Range", "bytes=" + String((unsigned long long)resumeOffset) + "-");
           }
           int code = http.GET();
-          if (resumeOffset > 0 && code == 200) {
+          if (resumable && resumeOffset > 0 && code == 200) {
             http.end();
             out.close();
             bool resetReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
@@ -7339,6 +7382,8 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
     if (!first) stream.print(',');
     first = false;
     stream.printf("{\"id\":%u", (unsigned)job->id);
+    stream.print(",\"importMode\":\"");
+    printJsonEscapedTo(stream, job->importMode);
     stream.print(",\"status\":\"");
     printJsonEscapedTo(stream, job->status);
     stream.print("\",\"success\":");
@@ -7598,6 +7643,8 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
   }
 
   String partKey = doc["partKey"] | "";
+  String ratingKey = doc["ratingKey"] | "";
+  String importMode = doc["importMode"] | "original";
   String destDir = doc["destDir"] | "";
   String filename = doc["filename"] | "";
   String label = doc["label"] | filename;
@@ -7606,6 +7653,14 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
 
   if (!partKey.startsWith("/")) {
     request->send(400, "application/json", "{\"error\":\"Invalid Plex part key\"}");
+    return;
+  }
+  if (importMode != "original" && importMode != "web") {
+    request->send(400, "application/json", "{\"error\":\"Invalid Plex import mode\"}");
+    return;
+  }
+  if (importMode == "web" && !isNumericPlexKey(ratingKey)) {
+    request->send(400, "application/json", "{\"error\":\"Web-compatible import requires a Plex rating key\"}");
     return;
   }
   if (!validateUploadFilename(filename, pathError)) {
@@ -7628,6 +7683,8 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
     return;
   }
   job->partKey = partKey;
+  job->ratingKey = ratingKey;
+  job->importMode = importMode;
   job->destDir = destDir;
   job->filename = filename;
   job->label = label;

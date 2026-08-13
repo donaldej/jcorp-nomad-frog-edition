@@ -2491,6 +2491,73 @@ String urlDecode(const String& str) {
 #include <set>
 #include <utility> // for std::pair
 
+String contentTypeForPath(const String &filePath, bool *isMediaStream = nullptr) {
+  String lowerPath = filePath;
+  lowerPath.toLowerCase();
+  bool media = false;
+  String contentType = "application/octet-stream";
+
+  if (lowerPath.endsWith(".epub")) contentType = "application/epub+zip";
+  else if (lowerPath.endsWith(".pdf")) contentType = "application/pdf";
+  else if (lowerPath.endsWith(".mp3")) { contentType = "audio/mpeg"; media = true; }
+  else if (lowerPath.endsWith(".flac")) { contentType = "audio/flac"; media = true; }
+  else if (lowerPath.endsWith(".wav")) { contentType = "audio/wav"; media = true; }
+  else if (lowerPath.endsWith(".ogg")) { contentType = "audio/ogg"; media = true; }
+  else if (lowerPath.endsWith(".aac")) { contentType = "audio/aac"; media = true; }
+  else if (lowerPath.endsWith(".m4a")) { contentType = "audio/mp4"; media = true; }
+  else if (lowerPath.endsWith(".mp4")) { contentType = "video/mp4"; media = true; }
+  else if (lowerPath.endsWith(".mkv")) { contentType = "video/x-matroska"; media = true; }
+  else if (lowerPath.endsWith(".webm")) { contentType = "video/webm"; media = true; }
+  else if (lowerPath.endsWith(".m4v")) { contentType = "video/x-m4v"; media = true; }
+  else if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")) contentType = "image/jpeg";
+  else if (lowerPath.endsWith(".png")) contentType = "image/png";
+  else if (lowerPath.endsWith(".cbz")) contentType = "application/vnd.comicbook+zip";
+  else if (lowerPath.endsWith(".cbr")) contentType = "application/vnd.comicbook-rar";
+
+  if (isMediaStream) *isMediaStream = media;
+  return contentType;
+}
+
+bool parseByteRange(const String &rangeHeader, size_t fileSize, size_t &startByte, size_t &endByte) {
+  if (!fileSize || !rangeHeader.startsWith("bytes=")) return false;
+
+  String rangeSpec = rangeHeader.substring(6);
+  rangeSpec.trim();
+  if (!rangeSpec.length() || rangeSpec.indexOf(',') >= 0) return false;
+
+  int dashIndex = rangeSpec.indexOf('-');
+  if (dashIndex < 0) return false;
+
+  String startStr = rangeSpec.substring(0, dashIndex);
+  String endStr = rangeSpec.substring(dashIndex + 1);
+  startStr.trim();
+  endStr.trim();
+
+  char *parseEnd = nullptr;
+  if (!startStr.length()) {
+    if (!endStr.length()) return false;
+    unsigned long suffixLength = strtoul(endStr.c_str(), &parseEnd, 10);
+    if (!parseEnd || *parseEnd != '\0' || suffixLength == 0) return false;
+    startByte = suffixLength >= fileSize ? 0 : fileSize - (size_t)suffixLength;
+    endByte = fileSize - 1;
+    return true;
+  }
+
+  unsigned long parsedStart = strtoul(startStr.c_str(), &parseEnd, 10);
+  if (!parseEnd || *parseEnd != '\0' || parsedStart >= fileSize) return false;
+  startByte = (size_t)parsedStart;
+
+  if (!endStr.length()) {
+    endByte = fileSize - 1;
+    return true;
+  }
+
+  unsigned long parsedEnd = strtoul(endStr.c_str(), &parseEnd, 10);
+  if (!parseEnd || *parseEnd != '\0' || parsedEnd < parsedStart) return false;
+  endByte = parsedEnd >= fileSize ? fileSize - 1 : (size_t)parsedEnd;
+  return true;
+}
+
 void handleRangeRequest(AsyncWebServerRequest *request) {
   if (indexingTasksActive) {
     Serial.println("[RangeHandler] Blocked: indexing in progress");
@@ -2542,9 +2609,11 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
   }
 
   size_t fileSize = file.size();
+  bool isMediaStream = false;
+  String mimeType = contentTypeForPath(filePath, &isMediaStream);
 
   if (request->method() == HTTP_HEAD) {
-    AsyncWebServerResponse *headResponse = request->beginResponse(200, "application/octet-stream", "");
+    AsyncWebServerResponse *headResponse = request->beginResponse(200, mimeType, "");
     headResponse->addHeader("Accept-Ranges", "bytes");
     headResponse->addHeader("Content-Length", String(fileSize));
     headResponse->addHeader("Cache-Control", "public, max-age=3600");
@@ -2563,56 +2632,20 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
   if (request->hasHeader("Range")) rangeHeader = request->header("Range");
 
   size_t startByte = 0;
-  size_t endByte = fileSize - 1;
-  bool openEndedRange = false;
-
-  if (rangeHeader.length() && rangeHeader.startsWith("bytes=")) {
-    int dashIndex = rangeHeader.indexOf('-');
-    // strtoul not toInt() - toInt() is signed 32-bit and overflows past 2GB (ZIM parts hit 4GB)
-    if (dashIndex > 6) {
-      startByte = (size_t)strtoul(rangeHeader.substring(6, dashIndex).c_str(), nullptr, 10);
-    }
-    if (dashIndex + 1 < rangeHeader.length()) {
-      String endStr = rangeHeader.substring(dashIndex + 1);
-      if (endStr.length() > 0) {
-        endByte = (size_t)strtoul(endStr.c_str(), nullptr, 10);
-      } else {
-        openEndedRange = true;
-      }
-    } else {
-      openEndedRange = true;
-    }
+  size_t endByte = fileSize ? fileSize - 1 : 0;
+  if (rangeHeader.length() && !parseByteRange(rangeHeader, fileSize, startByte, endByte)) {
+    bool sdTaken = (!sdMutex) || (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE);
+    file.close();
+    if (sdTaken && sdMutex) xSemaphoreGive(sdMutex);
+    AsyncWebServerResponse *invalidRange = request->beginResponse(416, "text/plain", "Requested range not satisfiable");
+    invalidRange->addHeader("Content-Range", "bytes */" + String(fileSize));
+    request->send(invalidRange);
+    return;
   }
-
-  if (openEndedRange && (endByte - startByte) > (8 * 1024 * 1024)) {
-    endByte = startByte + (8 * 1024 * 1024) - 1;
-  }
-
-  if (endByte >= fileSize) endByte = fileSize - 1;
-  if (startByte > endByte) startByte = endByte;
   size_t contentLength = endByte - startByte + 1;
 
-  String mimeType = "application/octet-stream";
   String pLower = filePath;
   pLower.toLowerCase();
-
-  bool isMediaStream = false;
-  if (pLower.endsWith(".epub")) mimeType = "application/epub+zip";
-  else if (pLower.endsWith(".pdf")) mimeType = "application/pdf";
-  else if (pLower.endsWith(".mp3")) { mimeType = "audio/mpeg"; isMediaStream = true; }
-  else if (pLower.endsWith(".flac")) { mimeType = "audio/flac"; isMediaStream = true; }
-  else if (pLower.endsWith(".wav")) { mimeType = "audio/wav"; isMediaStream = true; }
-  else if (pLower.endsWith(".ogg")) { mimeType = "audio/ogg"; isMediaStream = true; }
-  else if (pLower.endsWith(".aac")) { mimeType = "audio/aac"; isMediaStream = true; }
-  else if (pLower.endsWith(".m4a")) { mimeType = "audio/mp4"; isMediaStream = true; }
-  else if (pLower.endsWith(".mp4")) { mimeType = "video/mp4"; isMediaStream = true; }
-  else if (pLower.endsWith(".mkv")) { mimeType = "video/x-matroska"; isMediaStream = true; }
-  else if (pLower.endsWith(".webm")) { mimeType = "video/webm"; isMediaStream = true; }
-  else if (pLower.endsWith(".m4v")) { mimeType = "video/x-m4v"; isMediaStream = true; }
-  else if (pLower.endsWith(".jpg") || pLower.endsWith(".jpeg")) mimeType = "image/jpeg";
-  else if (pLower.endsWith(".png")) mimeType = "image/png";
-  else if (pLower.endsWith(".cbz")) mimeType = "application/vnd.comicbook+zip";
-  else if (pLower.endsWith(".cbr")) mimeType = "application/vnd.comicbook-rar";
 
   if (isMediaStream && startByte < 65536) {
     String fileName = filePath.substring(filePath.lastIndexOf('/') + 1);
@@ -2785,6 +2818,10 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     return;
   }
 
+  request->onDisconnect([streamId]() {
+    closeStreamById(streamId);
+  });
+
   if (rangeHeader.length() > 0) {
     response->setCode(206);
     response->addHeader("Content-Range", "bytes " + String(startByte) + "-" + String(endByte) + "/" + String(fileSize));
@@ -2798,7 +2835,6 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
   response->addHeader("Accept-Ranges", "bytes");
   response->addHeader("Content-Length", String(contentLength));
   response->addHeader("Cache-Control", "public, max-age=3600");
-  response->addHeader("Connection", "close");
   request->send(response);
 }
 void handleListFiles(AsyncWebServerRequest *request) {

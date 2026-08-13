@@ -27,7 +27,9 @@ Stream movies, music, books, and shows anywhere - no internet required.</p>
 
 ## What is Nomad
 
-Jcorp Nomad is an open-source offline media server designed for travel, remote work, classrooms, camping, and more. It runs entirely on an ESP32-S3, creates a local Wi-Fi hotspot, and serves media through a browser interface. Multiple users can access separate media streams simultaneously, all without internet access.
+Jcorp Nomad is an open-source offline media server designed for travel, remote work, classrooms, camping, and more. It runs entirely on an ESP32-S3, creates a local Wi-Fi hotspot, and serves media through a browser interface. Multiple users can browse the interface at the same time, all without internet access.
+
+For stability on the ESP32-S3, the current firmware permits one active media HTTP request at a time. Starting playback on a second device while another stream is active can interrupt or temporarily reject the first stream. Concurrent independent video playback is not currently supported.
 
 This project is compact, easy to modify, and includes optional 3D-printable hardware. Both firmware and web interface are fully open-source.
 
@@ -89,6 +91,20 @@ If you just want to support the project, donations are always appreciated:
 - Admin panel settings are now gated behind a login
 - Fixed a stuck brightness slider caused by an out-of-range default value
 
+### Frog Edition Additions
+
+- **AP + Home Wi-Fi:** Nomad keeps its offline access point available while optionally joining a configured home network, making large uploads and Plex access easier at home.
+- **Standalone Upload Manager:** The Uploads page provides multi-file selection, queue order, per-file progress, retry/cancel controls, and targeted library reindexing after uploads.
+- **Native Plex Import:** Configure a Plex server URL and token, browse movie and TV libraries, choose an import destination, and queue media without finding the source file manually.
+- **Persistent Plex Queue:** Device-side Plex imports are persisted and resumable. Imports continue after the browser tab closes, and queue state, progress, retry, cancel, and history are available when the page is reopened.
+- **Browser-Compatible Plex Media:** Plex imports can request H.264/AAC-compatible output for direct browser playback when source audio or container support would otherwise be a problem.
+- **Automatic Plex Sync:** Sync a Plex playlist or collection on a schedule, enforce a minimum free-space threshold, and optionally prune only files managed by that sync configuration.
+- **Bulk Transfer Mode:** Temporarily reduce nonessential background work during large Plex transfers to reserve memory and SD bandwidth for the import pipeline.
+- **Device Health & Diagnostics:** The Admin page reports heap, PSRAM, Wi-Fi, SD-card activity, watchdog state, active work, uptime, and persistent information about the previous restart.
+- **Admin OTA Updates:** Upload a compiled firmware image from the Admin page with partition validation and rollback protection if the new image cannot boot cleanly.
+- **Build Identity:** Firmware and Admin UI build identifiers make it clear which version is running. Firmware builds also select a different LED color as a visible update indicator.
+- **Media Stability:** Large-index loading, movie-page memory use, HTTP byte-range handling, and SD access have been hardened to reduce freezes and reboots.
+
 ### Default Themes (28)
 
 Default Blue, Forest Night, Cherry Blossom, Mocha Latte, Ocean Depths,
@@ -104,7 +120,12 @@ Burgundy Wine, Teal Oasis
 
 - **Offline Encyclopedia:** ZIM archive support for offline Wikipedia and other offline wikis, with fast on-device search.
 - **Admin Panel:** Full device controls, library indexing, Theme Customizer, login-gated settings.
+- **Home Network Mode:** Optional home Wi-Fi connection while the offline Nomad access point remains available.
 - **File Browser:** Upload, rename, delete, download, and inline file editing. (Recommended to use a PC)
+- **Upload Manager:** Standalone multi-file queue with progress, retry/cancel controls, and post-upload reindexing.
+- **Plex Import & Sync:** Persistent device-side imports, browser-compatible conversion, playlists/collections, scheduled sync, and managed-file pruning.
+- **Device Health:** Live resource metrics, watchdog state, previous-restart diagnostics, and firmware/UI build identity.
+- **OTA Firmware Updates:** Admin-page firmware installation with boot validation and rollback safeguards.
 - **Global Search:** Quickly find media across all categories from the Menu page.
 - **Music Player:** Seamless background playback with subdirectory playlists and a dynamic Queue.
 - **Movies & Shows:** Plyr-integrated playback with season/special folder support.
@@ -173,6 +194,29 @@ There are a few community forks that target other ESP32 boards, but your mileage
 
 ---
 
+## On-Device Plex Import
+
+Open **Plex Import** from the Menu or Admin page to configure the Plex server URL
+and token. Nomad can browse Plex movie and show libraries, load episodes, and
+import a selected item directly to an SD-card destination.
+
+The on-device queue is persistent and resumable. Once an item is queued, the
+browser tab may be closed; Nomad continues the transfer and exposes its current
+status when the Plex Import page is opened again. Queue entries can be cancelled,
+retried, or removed from history.
+
+Enable **Web Compatible** when the Plex source is not already suitable for direct
+browser playback. Plex will provide a compatible stream, including AAC audio when
+needed. **Bulk Transfer Mode** pauses nonessential background work during large
+imports. Automatic sync can periodically mirror a Plex playlist or collection,
+subject to the configured free-space limit.
+
+The Plex server URL is configurable and is not hard-coded. Nomad must be connected
+to a network that can reach the Plex server; the offline access point remains
+available while home Wi-Fi is enabled.
+
+---
+
 ## Plex to Nomad Helper
 
 Windows users can run `tools/plex-to-nomad.ps1` to copy selected movies or TV
@@ -189,6 +233,10 @@ The helper:
 - Creates matching folders on Nomad.
 - Uploads through Nomad's `/upload` endpoint with `curl.exe` progress.
 - Requests a Nomad reindex after uploads finish.
+
+This PowerShell helper is PC-driven, so the PC and script must remain running until
+the upload finishes. Use the on-device Plex Import queue when the transfer should
+continue independently of the browser or PC.
 
 If the Plex server's original file paths are not accessible from this PC, run:
 
@@ -219,21 +267,29 @@ removes the temporary file.
    - Consistent theme tokens across pages, no more mismatched dark colors.
 
 4. **Admin Page**
-   - Full device control: shutdown, restart, flash mode, Wi-Fi, RGB LEDs, brightness, credentials, indexing, and file management.
+   - Full device control: shutdown, restart, flash mode, AP and home Wi-Fi, RGB LEDs, brightness, credentials, indexing, and file management.
    - Login-gated settings so changes require the admin password.
    - Safe shutdown option for SD card health.
    - Real-time system console feedback.
+   - Device health metrics, persistent restart diagnostics, firmware/UI build identifiers, and OTA firmware updates with rollback protection.
 
 5. **Stability Improvements**
    - Fixed frontend NDJSON sync issues.
    - Crash recovery on large indexes.
    - Fixed a random-reboot bug tied to files over 2GB.
    - Dynamic LCD brightness adjustment.
-   - Streaming stability enhancements.
+   - Correct HTTP byte-range responses for reliable seeking and browser playback.
+   - Memory-safe movie index loading and PSRAM-backed background task stacks.
+   - A single active media-request limit prevents the concurrent-stream freezes seen on this hardware.
 
 6. **Improved Library Support**
    - Supports deeper folder structures for Shows and Music.
    - Flexible organization; media files can be nested at any level.
+
+7. **Persistent Transfer Workflows**
+   - Device-side Plex queue survives page navigation and browser closure.
+   - Resumable buffered imports expose progress, retry, cancellation, and history.
+   - Scheduled playlist/collection sync supports free-space limits and managed-file pruning.
 
 ---
 

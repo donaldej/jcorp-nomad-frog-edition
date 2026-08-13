@@ -200,9 +200,9 @@ struct StreamHandle {
   size_t lastEndByte;
 };
 static std::map<uint32_t, StreamHandle> streamingFiles;
-static std::map<String, uint32_t> streamPathIndex;
 static SemaphoreHandle_t streamingFilesMutex = NULL;
-static const int MAX_CONCURRENT_STREAMS = 8;
+static const int MAX_CONCURRENT_STREAMS = 1;
+volatile int activeStreams = 0;
 
 // close a handle we opened but never sent, so it doesn't leak until the LRU gets it
 static void closeStreamById(uint32_t streamId) {
@@ -212,9 +212,9 @@ static void closeStreamById(uint32_t streamId) {
   if (!locked) return;
   auto it = streamingFiles.find(streamId);
   if (it != streamingFiles.end()) {
-    streamPathIndex.erase(it->second.path);
     it->second.file.close();
     streamingFiles.erase(it);
+    activeStreams = streamingFiles.size();
   }
   if (streamingFilesMutex) xSemaphoreGive(streamingFilesMutex);
 }
@@ -225,7 +225,6 @@ static bool g_sdStatTrusted = false;
 const char* SD_USAGE_FILE = "/.system-index/sd_usage.json";
 static unsigned long lastScanTime = 0;
 volatile bool sdbarDirty = false;
-volatile int activeStreams = 0;
 struct IndexBuildArgs {
   String dir;   // directory path to build index for (ex: "/Music/Album")
   String out;   // output index filename
@@ -2009,7 +2008,6 @@ bool tryRecoverSDCard() {
         bool sdHeld = (!sdMutex) || (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE);
         for (auto &kv : streamingFiles) kv.second.file.close();
         streamingFiles.clear();
-        streamPathIndex.clear();
         activeStreams = 0;
 
         SD_MMC.end();          // unmount
@@ -2604,6 +2602,7 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
   else if (pLower.endsWith(".aac")) { mimeType = "audio/aac"; isMediaStream = true; }
   else if (pLower.endsWith(".m4a")) { mimeType = "audio/mp4"; isMediaStream = true; }
   else if (pLower.endsWith(".mp4")) { mimeType = "video/mp4"; isMediaStream = true; }
+  else if (pLower.endsWith(".mkv")) { mimeType = "video/x-matroska"; isMediaStream = true; }
   else if (pLower.endsWith(".webm")) { mimeType = "video/webm"; isMediaStream = true; }
   else if (pLower.endsWith(".m4v")) { mimeType = "video/x-m4v"; isMediaStream = true; }
   else if (pLower.endsWith(".jpg") || pLower.endsWith(".jpeg")) mimeType = "image/jpeg";
@@ -2645,42 +2644,12 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
       request->send(503, "text/plain", "SD busy");
       return;
     }
-    auto pidx = streamPathIndex.find(filePath);
-    if (pidx != streamPathIndex.end()) {
-      uint32_t existingId = pidx->second;
-      auto eit = streamingFiles.find(existingId);
-
-      bool stdio2GBGuard = (eit != streamingFiles.end() && eit->second.file &&
-                            eit->second.lastEndByte >= 0x7FFFF000UL);
-      if (eit != streamingFiles.end() && eit->second.file && !stdio2GBGuard) {
-        eit->second.file.seek(startByte);
-        eit->second.lastActivity = millis();
-        eit->second.lastEndByte = endByte;
-        streamId = existingId;
-        Serial.printf("[Stream] Reuse #%u seek %lu: %s (heap=%u)\n",
-                      streamId, (unsigned long)startByte, filePath.c_str(),
-                      (unsigned)ESP.getFreeHeap());
-        if (sdMutex) xSemaphoreGive(sdMutex);
-        xSemaphoreGive(streamingFilesMutex);
-        goto stream_ready;
-      } else {
-        if (stdio2GBGuard) {
-          Serial.printf("[Stream] Reopen #%u (pos>2GB stdio guard): %s\n",
-                        existingId, filePath.c_str());
-          eit->second.file.close();
-        }
-        streamPathIndex.erase(pidx);
-        if (eit != streamingFiles.end()) streamingFiles.erase(eit);
-      }
-    }
-
     bool isArchive = (filePath.indexOf("/Archive/") >= 0) || (filePath.indexOf("/archive/") >= 0);
     if (isArchive) {
       for (auto ait = streamingFiles.begin(); ait != streamingFiles.end(); ) {
         const String &ap = ait->second.path;
         if (ap.indexOf("/Archive/") >= 0 || ap.indexOf("/archive/") >= 0) {
           Serial.printf("[Stream] Archive single-handle: closing #%u (%s)\n", ait->first, ap.c_str());
-          streamPathIndex.erase(ait->second.path);
           ait->second.file.close();
           ait = streamingFiles.erase(ait);
         } else {
@@ -2690,23 +2659,19 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     }
 
     if ((int)streamingFiles.size() >= MAX_CONCURRENT_STREAMS) {
-      uint32_t oldestId = 0;
-      unsigned long oldestTime = 0xFFFFFFFFUL;
-      for (auto &kv : streamingFiles) {
-        if (kv.second.lastActivity < oldestTime) {
-          oldestTime = kv.second.lastActivity;
-          oldestId = kv.first;
-        }
+      Serial.printf("[Stream] Limit reached for %s (active=%d heap=%u)\n",
+                    filePath.c_str(), activeStreams, (unsigned)ESP.getFreeHeap());
+      if (sdMutex) xSemaphoreGive(sdMutex);
+      xSemaphoreGive(streamingFilesMutex);
+      AsyncWebServerResponse *busy = request->beginResponse(
+        503, "text/plain", "Too many active media requests; retry shortly");
+      if (busy) {
+        busy->addHeader("Retry-After", "2");
+        request->send(busy);
+      } else {
+        request->send(503, "text/plain", "Too many active media requests; retry shortly");
       }
-      if (oldestId) {
-        auto it = streamingFiles.find(oldestId);
-        if (it != streamingFiles.end()) {
-          Serial.printf("[Stream] Evicting #%u (%s)\n", oldestId, it->second.path.c_str());
-          streamPathIndex.erase(it->second.path);
-          it->second.file.close();
-          streamingFiles.erase(it);
-        }
-      }
+      return;
     }
 
     File f = SD_MMC.open(filePath, "r");
@@ -2726,7 +2691,6 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     sh.lastActivity = millis();
     sh.lastEndByte = endByte;
     streamingFiles[streamId] = sh;
-    streamPathIndex[filePath] = streamId;
     activeStreams = streamingFiles.size();
     Serial.printf("[Stream] New #%u at %lu: %s (active=%d heap=%u)\n",
                   streamId, (unsigned long)startByte, filePath.c_str(), activeStreams,
@@ -2739,12 +2703,10 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     return;
   }
 
-  stream_ready:
-
   AsyncWebServerResponse *response = request->beginResponse(
     mimeType,
     contentLength,
-    [streamId, filePath, startByte](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+    [streamId, filePath, startByte, contentLength](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
       // busy mutex isnt end-of-data: returning 0 truncates the response, TRY_AGAIN retries later
       if (streamingFilesMutex && xSemaphoreTake(streamingFilesMutex, pdMS_TO_TICKS(150)) != pdTRUE) {
         return RESPONSE_TRY_AGAIN;
@@ -2774,7 +2736,7 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
         sh.lastActivity = millis();
         sh.lastEndByte = startByte + index;
         streamingFiles[streamId] = sh;
-        streamPathIndex[filePath] = streamId;
+        activeStreams = streamingFiles.size();
         if (sdMutex) xSemaphoreGive(sdMutex);
         Serial.printf("[Stream] Reopened #%u at %lu (evicted mid-send): %s\n",
                       streamId, (unsigned long)(startByte + index), filePath.c_str());
@@ -2797,6 +2759,12 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
         xSemaphoreGive(sdMutex);
       } else {
         sdBusy = true;  // transient: retry this fill later, don't truncate
+      }
+      bool finished = !sdBusy && (bytesRead == 0 || index + bytesRead >= contentLength);
+      if (finished) {
+        file.close();
+        streamingFiles.erase(it);
+        activeStreams = streamingFiles.size();
       }
       xSemaphoreGive(streamingFilesMutex);
 
@@ -5756,12 +5724,11 @@ void checkStreamingTimeout() {
         unsigned long now = millis();
         int closed = 0;
         for (auto it = streamingFiles.begin(); it != streamingFiles.end(); ) {
-          bool stale = !it->second.file || (now - it->second.lastActivity > 120000UL);
+          bool stale = !it->second.file || (now - it->second.lastActivity > 30000UL);
           if (stale) {
             Serial.printf("[StreamCleanup] Idle #%u (%s, %lus)\n",
                           it->first, it->second.path.c_str(),
                           (unsigned long)((now - it->second.lastActivity) / 1000));
-            streamPathIndex.erase(it->second.path);
             it->second.file.close();
             it = streamingFiles.erase(it);
             closed++;

@@ -7,6 +7,10 @@
 #include <esp_heap_caps.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+extern "C" {
+  #include "lwip/tcp.h"
+  #include "lwip/tcpip.h"
+}
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
@@ -641,6 +645,11 @@ static std::atomic<uint32_t> ramThroughputCancelledCount{0};
 static std::atomic<uint32_t> ramThroughputBytesServed{0};
 volatile uint32_t ramThroughputLastBytes = 0;
 volatile unsigned long ramThroughputLastDurationMs = 0;
+static const uint32_t NOMAD_STREAM_TCP_SEND_BUFFER_BYTES = 8UL * CONFIG_LWIP_TCP_MSS;
+static std::atomic<uint32_t> tcpSendBufferTunedCount{0};
+static std::atomic<uint32_t> tcpSendBufferTuneFailureCount{0};
+volatile uint32_t tcpSendBufferLastBeforeBytes = 0;
+volatile uint32_t tcpSendBufferLastAfterBytes = 0;
 volatile uint32_t healthLowHeapWarnCount = 0;
 volatile uint32_t healthLowHeapRestartStreak = 0;
 volatile uint32_t healthCriticalHeapCount = 0;
@@ -667,6 +676,34 @@ volatile bool otaValidationPending = false;
 volatile unsigned long otaRestartAtMs = 0;
 uint32_t otaBootAttempts = 0;
 uint32_t otaPreviousPartitionAddress = 0;
+
+bool tuneStreamingTcpSendBuffer(AsyncWebServerRequest *request) {
+  AsyncClient *client = request ? request->client() : nullptr;
+  if (!client || !client->pcb()) {
+    tcpSendBufferTuneFailureCount.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  bool tuned = false;
+  LOCK_TCPIP_CORE();
+  tcp_pcb *pcb = client->pcb();
+  if (pcb && pcb->state == ESTABLISHED) {
+    uint32_t queuedBytes = pcb->snd_lbb - pcb->lastack;
+    uint32_t currentCapacity = (uint32_t)pcb->snd_buf + queuedBytes;
+    tcpSendBufferLastBeforeBytes = currentCapacity;
+    if (currentCapacity < NOMAD_STREAM_TCP_SEND_BUFFER_BYTES) {
+      pcb->snd_buf += NOMAD_STREAM_TCP_SEND_BUFFER_BYTES - currentCapacity;
+      currentCapacity = NOMAD_STREAM_TCP_SEND_BUFFER_BYTES;
+    }
+    tcpSendBufferLastAfterBytes = currentCapacity;
+    tuned = true;
+  }
+  UNLOCK_TCPIP_CORE();
+
+  if (tuned) tcpSendBufferTunedCount.fetch_add(1, std::memory_order_relaxed);
+  else tcpSendBufferTuneFailureCount.fetch_add(1, std::memory_order_relaxed);
+  return tuned;
+}
 
 BaseType_t createBackgroundTask(
     TaskFunction_t task, const char *name, uint32_t stackDepth, void *parameter,
@@ -2873,6 +2910,10 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     request->send(503, "text/plain", "Server busy");
     return;
   }
+
+  // Tune only after the stream has secured a slot. Rejected requests must not
+  // consume another enlarged lwIP send window while the active stream is busy.
+  if (isMediaStream) tuneStreamingTcpSendBuffer(request);
 
   AsyncWebServerResponse *response = request->beginResponse(
     mimeType,
@@ -7622,6 +7663,18 @@ server.on("/api/debug/throughput/ram", HTTP_GET, [](AsyncWebServerRequest *reque
     responseBytes = (size_t)requestedBytes;
   }
 
+  if (activePrimaryStreams > 0) {
+    AsyncWebServerResponse *busy = request->beginResponse(
+      409, "application/json", "{\"error\":\"Media stream active; retry benchmark later\"}");
+    if (busy) {
+      busy->addHeader("Retry-After", "2");
+      request->send(busy);
+    } else {
+      request->send(409, "application/json", "{\"error\":\"Media stream active; retry benchmark later\"}");
+    }
+    return;
+  }
+
   uint32_t benchmarkId = ramThroughputNextId.fetch_add(1, std::memory_order_relaxed);
   if (benchmarkId == 0) {
     benchmarkId = ramThroughputNextId.fetch_add(1, std::memory_order_relaxed);
@@ -7641,6 +7694,7 @@ server.on("/api/debug/throughput/ram", HTTP_GET, [](AsyncWebServerRequest *reque
   }
 
   ramThroughputRequestCount.fetch_add(1, std::memory_order_relaxed);
+  tuneStreamingTcpSendBuffer(request);
   unsigned long startedMs = millis();
   AsyncWebServerResponse *response = request->beginResponse(
     "application/octet-stream",
@@ -7709,6 +7763,9 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   unsigned long sdProbeMs = millis() - sdProbeStartMs;
 
   int queueDepth = indexQueue ? uxQueueMessagesWaiting(indexQueue) : 0;
+  TaskHandle_t asyncTcpTask = xTaskGetHandle("async_tcp");
+  UBaseType_t asyncTcpStackHighWaterBytes = asyncTcpTask
+    ? uxTaskGetStackHighWaterMark(asyncTcpTask) : 0;
   int streamCount = activeStreams;
   int primaryStreamCount = activePrimaryStreams;
   int auxiliaryStreamCount = activeAuxiliaryStreams;
@@ -7827,6 +7884,8 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   tasks["psramStackTasksCreated"] = backgroundPsramTaskCount;
   tasks["internalStackFallbacks"] = backgroundInternalTaskCount;
   tasks["internalSafetyTasks"] = 1;
+  tasks["asyncTcpStackConfiguredBytes"] = CONFIG_ASYNC_TCP_STACK_SIZE;
+  tasks["asyncTcpStackHighWaterBytes"] = asyncTcpStackHighWaterBytes;
 
   JsonObject http = doc.createNestedObject("http");
   http["debugPingCount"] = httpDebugPingCount;
@@ -7840,6 +7899,11 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   http["ramThroughputLastDurationMs"] = ramThroughputLastDurationMs;
   http["ramThroughputMinBytes"] = RAM_THROUGHPUT_MIN_BYTES;
   http["ramThroughputMaxBytes"] = RAM_THROUGHPUT_MAX_BYTES;
+  http["tcpSendBufferTargetBytes"] = NOMAD_STREAM_TCP_SEND_BUFFER_BYTES;
+  http["tcpSendBufferTunedCount"] = tcpSendBufferTunedCount.load(std::memory_order_relaxed);
+  http["tcpSendBufferTuneFailureCount"] = tcpSendBufferTuneFailureCount.load(std::memory_order_relaxed);
+  http["tcpSendBufferLastBeforeBytes"] = tcpSendBufferLastBeforeBytes;
+  http["tcpSendBufferLastAfterBytes"] = tcpSendBufferLastAfterBytes;
   http["lastDebugPingAgeMs"] = httpLastDebugPingMs > 0 ? nowMs - httpLastDebugPingMs : 0;
   http["lastDebugStatusAgeMs"] = httpLastDebugStatusMs > 0 ? nowMs - httpLastDebugStatusMs : 0;
   http["healthLastLogAgeMs"] = healthLastLogMs > 0 ? nowMs - healthLastLogMs : 0;

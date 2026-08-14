@@ -107,12 +107,18 @@ If you just want to support the project, donations are always appreciated:
 - **Faster SD Access:** Supported boards negotiate 4-bit high-speed SDMMC at boot, with automatic default-speed and 1-bit compatibility fallbacks.
 - **Responsive Artwork During Playback:** Posters, subtitles, and small sidecar metadata use a bounded PSRAM-backed response path so library UI requests do not consume the primary media-stream slot.
 - **Bounded Browser Ranges:** Open-ended audio and video requests are served in 16 MiB segments, reducing long-lived response state while preserving explicit ranges, suffix ranges, and seeking.
+- **Faster Home-Network Streaming:** Media responses use an enlarged, bounded lwIP send window, while an 8 KiB measured AsyncTCP task stack returns otherwise unused internal RAM to the device. Runtime diagnostics expose the active TCP target and AsyncTCP stack headroom.
 
 To measure the network and HTTP ceiling without touching the SD card, download 1-16 MiB from the diagnostic endpoint and compare the client-reported speed with an equal-sized `/media` range:
 
 ```powershell
 curl.exe -o NUL -w "speed=%{speed_download} bytes/s`n" "http://nomad.local/api/debug/throughput/ram?bytes=4194304"
 ```
+
+The benchmark returns HTTP 409 while a primary media stream is active so a
+diagnostic transfer cannot compete with playback for TCP memory. For large
+transfers, prefer Nomad's home Wi-Fi address over its direct hotspot: AP+STA mode
+shares one ESP32 radio and the direct AP path can be substantially slower.
 
 ### Default Themes (28)
 

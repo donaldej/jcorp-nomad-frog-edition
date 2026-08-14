@@ -630,6 +630,17 @@ volatile unsigned long httpDebugPingCount = 0;
 volatile unsigned long httpDebugStatusCount = 0;
 volatile unsigned long httpLastDebugPingMs = 0;
 volatile unsigned long httpLastDebugStatusMs = 0;
+static const size_t RAM_THROUGHPUT_DEFAULT_BYTES = 4UL * 1024UL * 1024UL;
+static const size_t RAM_THROUGHPUT_MIN_BYTES = 1UL * 1024UL * 1024UL;
+static const size_t RAM_THROUGHPUT_MAX_BYTES = 16UL * 1024UL * 1024UL;
+static std::atomic<uint32_t> ramThroughputNextId{1};
+static std::atomic<uint32_t> ramThroughputActiveId{0};
+static std::atomic<uint32_t> ramThroughputRequestCount{0};
+static std::atomic<uint32_t> ramThroughputCompletedCount{0};
+static std::atomic<uint32_t> ramThroughputCancelledCount{0};
+static std::atomic<uint32_t> ramThroughputBytesServed{0};
+volatile uint32_t ramThroughputLastBytes = 0;
+volatile unsigned long ramThroughputLastDurationMs = 0;
 volatile uint32_t healthLowHeapWarnCount = 0;
 volatile uint32_t healthLowHeapRestartStreak = 0;
 volatile uint32_t healthCriticalHeapCount = 0;
@@ -7590,6 +7601,90 @@ server.on("/api/debug/ping", HTTP_GET, [](AsyncWebServerRequest *request){
   request->send(204);
 });
 
+server.on("/api/debug/throughput/ram", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (!checkAdminAuth(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+
+  size_t responseBytes = RAM_THROUGHPUT_DEFAULT_BYTES;
+  if (request->hasParam("bytes")) {
+    String requestedValue = request->getParam("bytes")->value();
+    char *parseEnd = nullptr;
+    unsigned long requestedBytes = strtoul(requestedValue.c_str(), &parseEnd, 10);
+    bool invalidValue = parseEnd == requestedValue.c_str() || *parseEnd != '\0';
+    if (invalidValue || requestedBytes < RAM_THROUGHPUT_MIN_BYTES ||
+        requestedBytes > RAM_THROUGHPUT_MAX_BYTES) {
+      request->send(400, "application/json",
+        "{\"error\":\"bytes must be between 1048576 and 16777216\"}");
+      return;
+    }
+    responseBytes = (size_t)requestedBytes;
+  }
+
+  uint32_t benchmarkId = ramThroughputNextId.fetch_add(1, std::memory_order_relaxed);
+  if (benchmarkId == 0) {
+    benchmarkId = ramThroughputNextId.fetch_add(1, std::memory_order_relaxed);
+  }
+  uint32_t expectedActiveId = 0;
+  if (!ramThroughputActiveId.compare_exchange_strong(
+        expectedActiveId, benchmarkId, std::memory_order_acq_rel)) {
+    AsyncWebServerResponse *busy = request->beginResponse(
+      409, "application/json", "{\"error\":\"RAM throughput benchmark already active\"}");
+    if (busy) {
+      busy->addHeader("Retry-After", "2");
+      request->send(busy);
+    } else {
+      request->send(409, "application/json", "{\"error\":\"RAM throughput benchmark already active\"}");
+    }
+    return;
+  }
+
+  ramThroughputRequestCount.fetch_add(1, std::memory_order_relaxed);
+  unsigned long startedMs = millis();
+  AsyncWebServerResponse *response = request->beginResponse(
+    "application/octet-stream",
+    responseBytes,
+    [benchmarkId, responseBytes, startedMs](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      if (index >= responseBytes) return 0;
+      size_t count = responseBytes - index;
+      if (count > maxLen) count = maxLen;
+      memset(buffer, 0xA5, count);
+      ramThroughputBytesServed.fetch_add((uint32_t)count, std::memory_order_relaxed);
+
+      if (index + count >= responseBytes) {
+        uint32_t expectedId = benchmarkId;
+        if (ramThroughputActiveId.compare_exchange_strong(
+              expectedId, 0, std::memory_order_acq_rel)) {
+          ramThroughputLastBytes = (uint32_t)responseBytes;
+          ramThroughputLastDurationMs = millis() - startedMs;
+          ramThroughputCompletedCount.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      return count;
+    });
+
+  if (!response) {
+    uint32_t expectedId = benchmarkId;
+    ramThroughputActiveId.compare_exchange_strong(
+      expectedId, 0, std::memory_order_acq_rel);
+    request->send(503, "application/json", "{\"error\":\"Unable to allocate benchmark response\"}");
+    return;
+  }
+
+  response->addHeader("Cache-Control", "no-store");
+  response->addHeader("X-Nomad-Benchmark-Source", "ram");
+  response->addHeader("X-Nomad-Benchmark-Bytes", String(responseBytes));
+  request->onDisconnect([benchmarkId]() {
+    uint32_t expectedId = benchmarkId;
+    if (ramThroughputActiveId.compare_exchange_strong(
+          expectedId, 0, std::memory_order_acq_rel)) {
+      ramThroughputCancelledCount.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  request->send(response);
+});
+
 server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   httpDebugStatusCount++;
   httpLastDebugStatusMs = millis();
@@ -7736,6 +7831,15 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   JsonObject http = doc.createNestedObject("http");
   http["debugPingCount"] = httpDebugPingCount;
   http["debugStatusCount"] = httpDebugStatusCount;
+  http["ramThroughputActive"] = ramThroughputActiveId.load(std::memory_order_relaxed) != 0;
+  http["ramThroughputRequestCount"] = ramThroughputRequestCount.load(std::memory_order_relaxed);
+  http["ramThroughputCompletedCount"] = ramThroughputCompletedCount.load(std::memory_order_relaxed);
+  http["ramThroughputCancelledCount"] = ramThroughputCancelledCount.load(std::memory_order_relaxed);
+  http["ramThroughputBytesServed"] = ramThroughputBytesServed.load(std::memory_order_relaxed);
+  http["ramThroughputLastBytes"] = ramThroughputLastBytes;
+  http["ramThroughputLastDurationMs"] = ramThroughputLastDurationMs;
+  http["ramThroughputMinBytes"] = RAM_THROUGHPUT_MIN_BYTES;
+  http["ramThroughputMaxBytes"] = RAM_THROUGHPUT_MAX_BYTES;
   http["lastDebugPingAgeMs"] = httpLastDebugPingMs > 0 ? nowMs - httpLastDebugPingMs : 0;
   http["lastDebugStatusAgeMs"] = httpLastDebugStatusMs > 0 ? nowMs - httpLastDebugStatusMs : 0;
   http["healthLastLogAgeMs"] = healthLastLogMs > 0 ? nowMs - healthLastLogMs : 0;

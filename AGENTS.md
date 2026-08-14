@@ -57,12 +57,12 @@ Repeat with the appropriate filename/content for other SD files.
 
 ## Current Device State
 
-- Last verified firmware upload succeeded through `COM9`.
-- Last verified live firmware build ID: `Aug  8 2026 20:55:49`
-- Last verified build LED color: `#5FD391`
-- Last verified UI build ID in `admin.html`: `ui-20260809-001`
-- Live `/settings` verified firmware build identity and home WiFi connection were reporting correctly.
-- Live `/admin.html` and `/admin.js` were uploaded and verified after the build identity change.
+- Last verified firmware upload succeeded through the authenticated OTA endpoint.
+- Last verified live firmware build ID: `Aug 14 2026 09:08:33`
+- Last verified build LED color: `#BC7376`
+- The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
+- OTA validation completed on `app1`; `/menu` returned HTTP 200 with no critical heap events.
+- The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
 
 ## Recent Feature PRs
 
@@ -71,13 +71,17 @@ Repeat with the appropriate filename/content for other SD files.
 - PR #3: PC-side Plex-to-Nomad helper, merged.
 - PR #4: Native Plex import prototype, merged.
 - PR #5: Firmware and UI build identity indicators, open when this file was created.
+- PR #29: 4-bit high-speed SDMMC with safe fallback, merged.
+- PR #30: Separate bounded auxiliary media response path, merged.
+- PR #31: Bounded open-ended browser media ranges, merged.
+- PR #32: RAM-only throughput diagnostics, open when this file was updated.
 
-## Pending Work Notes
+## Performance Notes
 
-- A Plex import queue feature was started on branch `feature/plex-import-queue`.
-- Its in-progress changes were stashed with message `wip plex import queue`.
-- Do not mix the Plex queue work into unrelated feature branches.
-- The goal for the Plex queue is to let imports continue device-side after the browser tab closes and expose queue/progress status when returning to the page.
+- The persistent Plex import queue is merged and continues device-side after the browser tab closes.
+- A PSRAM media read-ahead experiment was rejected because all tested variants reduced throughput; no PR was created.
+- Matched 4 MiB tests measured a median of 932,510 B/s from RAM and 861,848 B/s from SD-backed `/media`.
+- The small RAM-versus-SD gap indicates that WiFi/TCP/AsyncWebServer is the primary throughput ceiling; avoid further SD buffering work without new evidence.
 
 ## Implementation Notes
 

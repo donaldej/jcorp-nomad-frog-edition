@@ -58,10 +58,10 @@ Repeat with the appropriate filename/content for other SD files.
 ## Current Device State
 
 - Last verified firmware upload succeeded through the authenticated OTA endpoint.
-- Last verified live firmware build ID: `Aug 14 2026 10:42:41`
-- Last verified build LED color: `#44CB73`
+- Last verified live firmware build ID: `Aug 14 2026 13:43:48`
+- Last verified build LED color: `#A1626C`
 - The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
-- OTA validation completed on `app0`; `/menu` returned HTTP 200 with no critical heap events.
+- OTA validation completed on `app1`; `/menu` returned HTTP 200 with no critical heap events.
 - The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
 - The live candidate uses an 11,488-byte (8 MSS) streaming TCP send target and an 8 KiB AsyncTCP task stack.
 
@@ -76,7 +76,7 @@ Repeat with the appropriate filename/content for other SD files.
 - PR #30: Separate bounded auxiliary media response path, merged.
 - PR #31: Bounded open-ended browser media ranges, merged.
 - PR #32: RAM-only throughput diagnostics, merged.
-- PR #33: Bounded streaming TCP send-window and AsyncTCP stack tuning, open when this file was updated.
+- PR #33: Bounded streaming TCP send-window and AsyncTCP stack tuning, merged.
 
 ## Performance Notes
 
@@ -85,6 +85,7 @@ Repeat with the appropriate filename/content for other SD files.
 - Pre-tuning matched home-network tests measured median throughput of 940,596 B/s from RAM and 866,311 B/s from SD-backed `/media`.
 - Expanding accepted streaming connections from the core's 5,744-byte send capacity to 11,488 bytes measured 1,323,971 B/s from RAM and 1,185,682 B/s from media: gains of 40.8% and 36.9%.
 - AsyncTCP's documented 16 KiB default stack left substantial unused capacity. `firmware/JcorpNomadProject/build_opt.h` sets it to 8 KiB; a concurrent stream/UI stress test retained 4,448 bytes of stack headroom and 13,580 bytes minimum internal heap with zero low/critical events.
+- Pinning AsyncTCP to application core 1 was tested and rejected. Runtime diagnostics confirmed callbacks ran on core 1, but combined candidate medians fell to about 1,308,641 B/s from RAM and 1,162,915 B/s from media, with substantially more low outliers. Restored unpinned firmware recovered to 1,317,121 B/s and 1,175,506 B/s in the final three-trial check.
 - Tune media TCP capacity only after a request secures the primary stream slot. The RAM benchmark returns 409 during playback so rejected/diagnostic connections cannot allocate competing enlarged windows.
 - Direct AP testing was much slower despite a 72 Mbps reported link: median 1 MiB RAM and media rates were 86,842 B/s and 111,538 B/s. Home WiFi through the router should be preferred for Plex imports and large transfers; AP+STA shares one ESP32 radio.
 - The small RAM-versus-SD gap indicates that WiFi/TCP/AsyncWebServer is the primary throughput ceiling; avoid further SD buffering work without new evidence.

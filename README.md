@@ -106,6 +106,7 @@ If you just want to support the project, donations are always appreciated:
 - **Media Stability:** Large-index loading, movie-page memory use, HTTP byte-range handling, and SD access have been hardened to reduce freezes and reboots.
 - **Faster SD Access:** Supported boards negotiate 4-bit high-speed SDMMC at boot, with automatic default-speed and 1-bit compatibility fallbacks.
 - **Responsive Artwork During Playback:** Posters, subtitles, and small sidecar metadata use a bounded PSRAM-backed response path so library UI requests do not consume the primary media-stream slot.
+- **Bounded Browser Ranges:** Open-ended audio and video requests are served in 16 MiB segments, reducing long-lived response state while preserving explicit ranges, suffix ranges, and seeking.
 
 ### Default Themes (28)
 
@@ -284,6 +285,7 @@ removes the temporary file.
    - Memory-safe movie index loading and PSRAM-backed background task stacks.
    - 4-bit high-speed SDMMC mounting with safe fallbacks and live bus diagnostics.
    - A separate bounded auxiliary response path keeps artwork and metadata available during playback.
+   - Open-ended browser media ranges are capped without changing explicit seek ranges.
    - A single active media-request limit prevents the concurrent-stream freezes seen on this hardware.
 
 6. **Improved Library Support**

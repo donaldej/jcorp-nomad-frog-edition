@@ -208,6 +208,8 @@ static const int MAX_CONCURRENT_PRIMARY_STREAMS = 1;
 static const int MAX_CONCURRENT_AUXILIARY_STREAMS = 1;
 static const int MAX_CONCURRENT_STREAMS = 2;
 static const size_t MAX_AUXILIARY_ASSET_BYTES = 2UL * 1024UL * 1024UL;
+static const size_t MAX_OPEN_ENDED_MEDIA_RANGE_BYTES = 16UL * 1024UL * 1024UL;
+static std::atomic<uint32_t> boundedMediaRangeCount{0};
 volatile int activeStreams = 0;
 volatile int activePrimaryStreams = 0;
 volatile int activeAuxiliaryStreams = 0;
@@ -2600,7 +2602,9 @@ bool isAuxiliaryAssetPath(const String &filePath) {
          lowerPath.endsWith(".json") || lowerPath.endsWith(".ndjson");
 }
 
-bool parseByteRange(const String &rangeHeader, size_t fileSize, size_t &startByte, size_t &endByte) {
+bool parseByteRange(const String &rangeHeader, size_t fileSize, size_t &startByte,
+                    size_t &endByte, bool *openEnded = nullptr) {
+  if (openEnded) *openEnded = false;
   if (!fileSize || !rangeHeader.startsWith("bytes=")) return false;
 
   String rangeSpec = rangeHeader.substring(6);
@@ -2630,6 +2634,7 @@ bool parseByteRange(const String &rangeHeader, size_t fileSize, size_t &startByt
   startByte = (size_t)parsedStart;
 
   if (!endStr.length()) {
+    if (openEnded) *openEnded = true;
     endByte = fileSize - 1;
     return true;
   }
@@ -2717,7 +2722,9 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
 
   size_t startByte = 0;
   size_t endByte = fileSize ? fileSize - 1 : 0;
-  if (rangeHeader.length() && !parseByteRange(rangeHeader, fileSize, startByte, endByte)) {
+  bool openEndedRange = false;
+  if (rangeHeader.length() &&
+      !parseByteRange(rangeHeader, fileSize, startByte, endByte, &openEndedRange)) {
     bool sdTaken = (!sdMutex) || (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE);
     file.close();
     if (sdTaken && sdMutex) xSemaphoreGive(sdMutex);
@@ -2725,6 +2732,15 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
     invalidRange->addHeader("Content-Range", "bytes */" + String(fileSize));
     request->send(invalidRange);
     return;
+  }
+  bool boundedOpenEndedRange = false;
+  if (isMediaStream && openEndedRange) {
+    size_t remaining = fileSize - startByte;
+    if (remaining > MAX_OPEN_ENDED_MEDIA_RANGE_BYTES) {
+      endByte = startByte + MAX_OPEN_ENDED_MEDIA_RANGE_BYTES - 1;
+      boundedOpenEndedRange = true;
+      boundedMediaRangeCount.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   size_t contentLength = endByte - startByte + 1;
 
@@ -2933,6 +2949,9 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
   if (rangeHeader.length() > 0) {
     response->setCode(206);
     response->addHeader("Content-Range", "bytes " + String(startByte) + "-" + String(endByte) + "/" + String(fileSize));
+    if (boundedOpenEndedRange) {
+      response->addHeader("X-Nomad-Range-Capped", "1");
+    }
   } else {
     response->setCode(200);
   }
@@ -7730,6 +7749,8 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   http["lastFreeHeap"] = healthLastFreeHeap;
   http["lastMinFreeHeap"] = healthLastMinFreeHeap;
   http["lastMaxAllocHeap"] = healthLastMaxAllocHeap;
+  http["boundedMediaRangeCount"] = boundedMediaRangeCount.load(std::memory_order_relaxed);
+  http["maxOpenEndedRangeBytes"] = MAX_OPEN_ENDED_MEDIA_RANGE_BYTES;
   http["lowHeapWarnBytes"] = HEALTH_LOW_HEAP_WARN_BYTES;
   http["lowHeapRestartBytes"] = HEALTH_LOW_HEAP_RESTART_BYTES;
   http["criticalMinHeapBytes"] = HEALTH_CRITICAL_MIN_HEAP_BYTES;

@@ -15,16 +15,20 @@ const rangeHandler = firmware.slice(
 assert.match(firmware, /bool parseByteRange\(/);
 assert.match(firmware, /if \(!startStr\.length\(\)\)[\s\S]{0,500}fileSize - \(size_t\)suffixLength/,
   'suffix ranges must resolve relative to the end of the file');
-assert.match(firmware, /if \(!endStr\.length\(\)\) \{\s*endByte = fileSize - 1;/,
-  'open-ended ranges must extend to the end of the file');
+assert.match(firmware, /if \(!endStr\.length\(\)\) \{\s*if \(openEnded\) \*openEnded = true;\s*endByte = fileSize - 1;/,
+  'the parser must identify open-ended ranges before the media policy is applied');
+assert.match(firmware, /MAX_OPEN_ENDED_MEDIA_RANGE_BYTES = 16UL \* 1024UL \* 1024UL/);
+assert.match(firmware, /if \(isMediaStream && openEndedRange\)[\s\S]{0,300}endByte = startByte \+ MAX_OPEN_ENDED_MEDIA_RANGE_BYTES - 1;/,
+  'only open-ended audio/video responses should be capped');
+assert.match(firmware, /response->addHeader\("X-Nomad-Range-Capped", "1"\)/);
 assert.match(firmware, /beginResponse\(416, "text\/plain", "Requested range not satisfiable"\)/);
 assert.match(firmware, /"Content-Range", "bytes \*\/" \+ String\(fileSize\)/);
 assert.match(firmware, /beginResponse\(200, mimeType, ""\)/,
   'HEAD responses must report the same media type as GET responses');
 assert.match(firmware, /request->onDisconnect\(\[streamId\]\(\) \{\s*closeStreamById\(streamId\);/,
   'abandoned open-ended ranges must release the stream immediately');
-assert.doesNotMatch(firmware, /openEndedRange/,
-  'open-ended ranges must not be silently truncated');
+assert.match(firmware, /http\["boundedMediaRangeCount"\] = boundedMediaRangeCount\.load/,
+  'debug status should expose how often the range cap is used');
 assert.doesNotMatch(rangeHandler, /response->addHeader\("Connection", "close"\)/,
   'the async response owns its Connection header');
 

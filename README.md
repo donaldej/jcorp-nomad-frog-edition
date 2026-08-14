@@ -100,13 +100,19 @@ If you just want to support the project, donations are always appreciated:
 - **Browser-Compatible Plex Media:** Plex imports can request H.264/AAC-compatible output for direct browser playback when source audio or container support would otherwise be a problem.
 - **Automatic Plex Sync:** Sync a Plex playlist or collection on a schedule, enforce a minimum free-space threshold, and optionally prune only files managed by that sync configuration.
 - **Bulk Transfer Mode:** Temporarily reduce nonessential background work during large Plex transfers to reserve memory and SD bandwidth for the import pipeline.
-- **Device Health & Diagnostics:** The Admin page reports heap, PSRAM, Wi-Fi, SD-card activity, watchdog state, active work, uptime, and persistent information about the previous restart.
+- **Device Health & Diagnostics:** The Admin page reports heap, PSRAM, Wi-Fi, SD-card activity, watchdog state, active work, uptime, and persistent information about the previous restart. An authenticated RAM-only throughput endpoint isolates HTTP/Wi-Fi performance from SD-card reads.
 - **Admin OTA Updates:** Upload a compiled firmware image from the Admin page with partition validation and rollback protection if the new image cannot boot cleanly.
 - **Build Identity:** Firmware and Admin UI build identifiers make it clear which version is running. Firmware builds also select a different LED color as a visible update indicator.
 - **Media Stability:** Large-index loading, movie-page memory use, HTTP byte-range handling, and SD access have been hardened to reduce freezes and reboots.
 - **Faster SD Access:** Supported boards negotiate 4-bit high-speed SDMMC at boot, with automatic default-speed and 1-bit compatibility fallbacks.
 - **Responsive Artwork During Playback:** Posters, subtitles, and small sidecar metadata use a bounded PSRAM-backed response path so library UI requests do not consume the primary media-stream slot.
 - **Bounded Browser Ranges:** Open-ended audio and video requests are served in 16 MiB segments, reducing long-lived response state while preserving explicit ranges, suffix ranges, and seeking.
+
+To measure the network and HTTP ceiling without touching the SD card, download 1-16 MiB from the diagnostic endpoint and compare the client-reported speed with an equal-sized `/media` range:
+
+```powershell
+curl.exe -o NUL -w "speed=%{speed_download} bytes/s`n" "http://nomad.local/api/debug/throughput/ram?bytes=4194304"
+```
 
 ### Default Themes (28)
 

@@ -58,11 +58,12 @@ Repeat with the appropriate filename/content for other SD files.
 ## Current Device State
 
 - Last verified firmware upload succeeded through the authenticated OTA endpoint.
-- Last verified live firmware build ID: `Aug 14 2026 09:08:33`
-- Last verified build LED color: `#BC7376`
+- Last verified live firmware build ID: `Aug 14 2026 10:42:41`
+- Last verified build LED color: `#44CB73`
 - The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
-- OTA validation completed on `app1`; `/menu` returned HTTP 200 with no critical heap events.
+- OTA validation completed on `app0`; `/menu` returned HTTP 200 with no critical heap events.
 - The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
+- The live candidate uses an 11,488-byte (8 MSS) streaming TCP send target and an 8 KiB AsyncTCP task stack.
 
 ## Recent Feature PRs
 
@@ -74,13 +75,18 @@ Repeat with the appropriate filename/content for other SD files.
 - PR #29: 4-bit high-speed SDMMC with safe fallback, merged.
 - PR #30: Separate bounded auxiliary media response path, merged.
 - PR #31: Bounded open-ended browser media ranges, merged.
-- PR #32: RAM-only throughput diagnostics, open when this file was updated.
+- PR #32: RAM-only throughput diagnostics, merged.
+- PR #33: Bounded streaming TCP send-window and AsyncTCP stack tuning, open when this file was updated.
 
 ## Performance Notes
 
 - The persistent Plex import queue is merged and continues device-side after the browser tab closes.
 - A PSRAM media read-ahead experiment was rejected because all tested variants reduced throughput; no PR was created.
-- Matched 4 MiB tests measured a median of 932,510 B/s from RAM and 861,848 B/s from SD-backed `/media`.
+- Pre-tuning matched home-network tests measured median throughput of 940,596 B/s from RAM and 866,311 B/s from SD-backed `/media`.
+- Expanding accepted streaming connections from the core's 5,744-byte send capacity to 11,488 bytes measured 1,323,971 B/s from RAM and 1,185,682 B/s from media: gains of 40.8% and 36.9%.
+- AsyncTCP's documented 16 KiB default stack left substantial unused capacity. `firmware/JcorpNomadProject/build_opt.h` sets it to 8 KiB; a concurrent stream/UI stress test retained 4,448 bytes of stack headroom and 13,580 bytes minimum internal heap with zero low/critical events.
+- Tune media TCP capacity only after a request secures the primary stream slot. The RAM benchmark returns 409 during playback so rejected/diagnostic connections cannot allocate competing enlarged windows.
+- Direct AP testing was much slower despite a 72 Mbps reported link: median 1 MiB RAM and media rates were 86,842 B/s and 111,538 B/s. Home WiFi through the router should be preferred for Plex imports and large transfers; AP+STA shares one ESP32 radio.
 - The small RAM-versus-SD gap indicates that WiFi/TCP/AsyncWebServer is the primary throughput ceiling; avoid further SD buffering work without new evidence.
 
 ## Implementation Notes
@@ -88,4 +94,5 @@ Repeat with the appropriate filename/content for other SD files.
 - Admin web files are served from the SD card template and usually need both firmware compile/upload and SD file upload when endpoints and UI change together.
 - Theme-aware pages use `theme-boot.js`, `theme-manager.js`, and the global `ThemeManager` symbol, not `window.ThemeManager`.
 - Avoid storing generated Arduino build directories in git.
+- Changing `build_opt.h` invalidates the entire Arduino/ESP32 dependency cache and took about 23 minutes with `--jobs 1`; unchanged incremental builds returned to about 40 seconds.
 - Prefer `rg` for searches and keep edits narrowly scoped.

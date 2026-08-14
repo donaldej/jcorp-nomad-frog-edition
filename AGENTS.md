@@ -76,6 +76,7 @@ Repeat with the appropriate filename/content for other SD files.
 - PR #30: Separate bounded auxiliary media response path, merged.
 - PR #31: Bounded open-ended browser media ranges, merged.
 - PR #32: RAM-only throughput diagnostics, merged.
+- PR #33: Bounded streaming TCP send-window and AsyncTCP stack tuning, open when this file was updated.
 
 ## Performance Notes
 

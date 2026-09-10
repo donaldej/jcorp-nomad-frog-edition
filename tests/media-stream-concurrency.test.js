@@ -8,12 +8,12 @@ const firmware = fs.readFileSync(
   'utf8'
 );
 
-assert.match(firmware, /static const int MAX_CONCURRENT_PRIMARY_STREAMS = 1/,
-  'the async web stack must still allow only one primary media response');
+assert.match(firmware, /static const int MAX_CONCURRENT_PRIMARY_STREAMS = 2/,
+  'two independent primary media responses should be allowed');
 assert.match(firmware, /static const int MAX_CONCURRENT_AUXILIARY_STREAMS = 1/,
   'only one bounded thumbnail or metadata response may accompany playback');
 assert.match(firmware, /static const int MAX_CONCURRENT_STREAMS = 2/,
-  'the overall response cap must remain bounded');
+  'the overall SD-backed response cap must remain bounded');
 assert.doesNotMatch(firmware, /streamPathIndex/,
   'separate clients must never share a seekable SD file handle');
 assert.doesNotMatch(firmware, /\[Stream\] Reuse|\[Stream\] Evicting/,

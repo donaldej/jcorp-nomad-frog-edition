@@ -29,7 +29,7 @@ Stream movies, music, books, and shows anywhere - no internet required.</p>
 
 Jcorp Nomad is an open-source offline media server designed for travel, remote work, classrooms, camping, and more. It runs entirely on an ESP32-S3, creates a local Wi-Fi hotspot, and serves media through a browser interface. Multiple users can browse the interface at the same time, all without internet access.
 
-For stability on the ESP32-S3, the current firmware permits one active media HTTP request at a time. Starting playback on a second device while another stream is active can interrupt or temporarily reject the first stream. Concurrent independent video playback is not currently supported.
+The Frog Edition firmware supports up to two independent media streams at once. Each client receives its own SD-card file handle and byte-range state, so seeking on one device does not interrupt the other. Because both streams share the ESP32-S3 Wi-Fi radio and SD bus, high-bitrate files may still buffer when two clients play simultaneously.
 
 This project is compact, easy to modify, and includes optional 3D-printable hardware. Both firmware and web interface are fully open-source.
 
@@ -107,7 +107,10 @@ If you just want to support the project, donations are always appreciated:
 - **Faster SD Access:** Supported boards negotiate 4-bit high-speed SDMMC at boot, with automatic default-speed and 1-bit compatibility fallbacks.
 - **Responsive Artwork During Playback:** Posters, subtitles, and small sidecar metadata use a bounded PSRAM-backed response path so library UI requests do not consume the primary media-stream slot.
 - **Bounded Browser Ranges:** Open-ended audio and video requests are served in 16 MiB segments, reducing long-lived response state while preserving explicit ranges, suffix ranges, and seeking.
-- **Faster Home-Network Streaming:** Media responses use an enlarged, bounded lwIP send window, while an 8 KiB measured AsyncTCP task stack returns otherwise unused internal RAM to the device. Runtime diagnostics expose the active TCP target and AsyncTCP stack headroom.
+- **Two-Client Playback:** Up to two primary media requests can run concurrently with separate file handles and seek positions. A bounded overall response cap prevents additional SD-backed requests from exhausting internal memory.
+- **Memory-Bounded Streaming:** Each media connection uses the ESP32 network stack's four-MSS send capacity, while a measured 6 KiB AsyncTCP task stack returns internal RAM to the two-client workload. Runtime diagnostics expose the active TCP target, stream counts, heap low-water mark, and AsyncTCP stack headroom.
+
+Two-client playback is intended for browser-compatible, moderate-bitrate media. On the development network, two simultaneous range transfers sustained approximately 0.63 MB/s per client and passed independent seek-integrity checks. A single stream sustained approximately 0.92 MB/s. Results vary with Wi-Fi conditions and media bitrate; use home Wi-Fi instead of the direct Nomad hotspot when concurrent playback matters.
 
 To measure the network and HTTP ceiling without touching the SD card, download 1-16 MiB from the diagnostic endpoint and compare the client-reported speed with an equal-sized `/media` range:
 
@@ -298,7 +301,7 @@ removes the temporary file.
    - 4-bit high-speed SDMMC mounting with safe fallbacks and live bus diagnostics.
    - A separate bounded auxiliary response path keeps artwork and metadata available during playback.
    - Open-ended browser media ranges are capped without changing explicit seek ranges.
-   - A single active media-request limit prevents the concurrent-stream freezes seen on this hardware.
+   - A bounded two-primary-stream limit permits independent playback without allowing unbounded SD and TCP memory use.
 
 6. **Improved Library Support**
    - Supports deeper folder structures for Shows and Music.

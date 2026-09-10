@@ -208,7 +208,7 @@ struct StreamHandle {
 };
 static std::map<uint32_t, StreamHandle> streamingFiles;
 static SemaphoreHandle_t streamingFilesMutex = NULL;
-static const int MAX_CONCURRENT_PRIMARY_STREAMS = 1;
+static const int MAX_CONCURRENT_PRIMARY_STREAMS = 2;
 static const int MAX_CONCURRENT_AUXILIARY_STREAMS = 1;
 static const int MAX_CONCURRENT_STREAMS = 2;
 static const size_t MAX_AUXILIARY_ASSET_BYTES = 2UL * 1024UL * 1024UL;
@@ -645,7 +645,8 @@ static std::atomic<uint32_t> ramThroughputCancelledCount{0};
 static std::atomic<uint32_t> ramThroughputBytesServed{0};
 volatile uint32_t ramThroughputLastBytes = 0;
 volatile unsigned long ramThroughputLastDurationMs = 0;
-static const uint32_t NOMAD_STREAM_TCP_SEND_BUFFER_BYTES = 8UL * CONFIG_LWIP_TCP_MSS;
+static const uint32_t NOMAD_MEDIA_TCP_SEND_BUFFER_BYTES = 4UL * CONFIG_LWIP_TCP_MSS;
+static const uint32_t NOMAD_BENCHMARK_TCP_SEND_BUFFER_BYTES = 8UL * CONFIG_LWIP_TCP_MSS;
 static std::atomic<uint32_t> tcpSendBufferTunedCount{0};
 static std::atomic<uint32_t> tcpSendBufferTuneFailureCount{0};
 volatile uint32_t tcpSendBufferLastBeforeBytes = 0;
@@ -677,7 +678,7 @@ volatile unsigned long otaRestartAtMs = 0;
 uint32_t otaBootAttempts = 0;
 uint32_t otaPreviousPartitionAddress = 0;
 
-bool tuneStreamingTcpSendBuffer(AsyncWebServerRequest *request) {
+bool tuneStreamingTcpSendBuffer(AsyncWebServerRequest *request, uint32_t targetBytes) {
   AsyncClient *client = request ? request->client() : nullptr;
   if (!client || !client->pcb()) {
     tcpSendBufferTuneFailureCount.fetch_add(1, std::memory_order_relaxed);
@@ -691,9 +692,9 @@ bool tuneStreamingTcpSendBuffer(AsyncWebServerRequest *request) {
     uint32_t queuedBytes = pcb->snd_lbb - pcb->lastack;
     uint32_t currentCapacity = (uint32_t)pcb->snd_buf + queuedBytes;
     tcpSendBufferLastBeforeBytes = currentCapacity;
-    if (currentCapacity < NOMAD_STREAM_TCP_SEND_BUFFER_BYTES) {
-      pcb->snd_buf += NOMAD_STREAM_TCP_SEND_BUFFER_BYTES - currentCapacity;
-      currentCapacity = NOMAD_STREAM_TCP_SEND_BUFFER_BYTES;
+    if (currentCapacity < targetBytes) {
+      pcb->snd_buf += targetBytes - currentCapacity;
+      currentCapacity = targetBytes;
     }
     tcpSendBufferLastAfterBytes = currentCapacity;
     tuned = true;
@@ -2913,7 +2914,7 @@ void handleRangeRequest(AsyncWebServerRequest *request) {
 
   // Tune only after the stream has secured a slot. Rejected requests must not
   // consume another enlarged lwIP send window while the active stream is busy.
-  if (isMediaStream) tuneStreamingTcpSendBuffer(request);
+  if (isMediaStream) tuneStreamingTcpSendBuffer(request, NOMAD_MEDIA_TCP_SEND_BUFFER_BYTES);
 
   AsyncWebServerResponse *response = request->beginResponse(
     mimeType,
@@ -7694,7 +7695,7 @@ server.on("/api/debug/throughput/ram", HTTP_GET, [](AsyncWebServerRequest *reque
   }
 
   ramThroughputRequestCount.fetch_add(1, std::memory_order_relaxed);
-  tuneStreamingTcpSendBuffer(request);
+  tuneStreamingTcpSendBuffer(request, NOMAD_BENCHMARK_TCP_SEND_BUFFER_BYTES);
   unsigned long startedMs = millis();
   AsyncWebServerResponse *response = request->beginResponse(
     "application/octet-stream",
@@ -7899,7 +7900,9 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   http["ramThroughputLastDurationMs"] = ramThroughputLastDurationMs;
   http["ramThroughputMinBytes"] = RAM_THROUGHPUT_MIN_BYTES;
   http["ramThroughputMaxBytes"] = RAM_THROUGHPUT_MAX_BYTES;
-  http["tcpSendBufferTargetBytes"] = NOMAD_STREAM_TCP_SEND_BUFFER_BYTES;
+  http["tcpSendBufferTargetBytes"] = NOMAD_MEDIA_TCP_SEND_BUFFER_BYTES;
+  http["mediaTcpSendBufferTargetBytes"] = NOMAD_MEDIA_TCP_SEND_BUFFER_BYTES;
+  http["benchmarkTcpSendBufferTargetBytes"] = NOMAD_BENCHMARK_TCP_SEND_BUFFER_BYTES;
   http["tcpSendBufferTunedCount"] = tcpSendBufferTunedCount.load(std::memory_order_relaxed);
   http["tcpSendBufferTuneFailureCount"] = tcpSendBufferTuneFailureCount.load(std::memory_order_relaxed);
   http["tcpSendBufferLastBeforeBytes"] = tcpSendBufferLastBeforeBytes;

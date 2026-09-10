@@ -58,12 +58,16 @@ Repeat with the appropriate filename/content for other SD files.
 ## Current Device State
 
 - Last verified firmware upload succeeded through the authenticated OTA endpoint.
-- Last verified live firmware build ID: `Aug 14 2026 13:43:48`
-- Last verified build LED color: `#A1626C`
+- Last verified live firmware build ID: `Sep  9 2026 23:14:54`
+- Last verified build LED color: `#4562C5`
 - The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
-- OTA validation completed on `app1`; `/menu` returned HTTP 200 with no critical heap events.
+- OTA validation completed on `app0`; the device remained responsive through repeated dual-stream tests.
 - The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
-- The live candidate uses an 11,488-byte (8 MSS) streaming TCP send target and an 8 KiB AsyncTCP task stack.
+- The live device is running an unmerged two-primary-stream experiment from
+  `performance/two-primary-streams`: each media connection uses the default
+  5,744-byte (4 MSS) TCP send target and AsyncTCP uses a 6 KiB task stack.
+- Merged `main` remains on one primary stream, an 11,488-byte (8 MSS) media TCP
+  send target, and an 8 KiB AsyncTCP stack until real playback validates the experiment.
 
 ## Recent Feature PRs
 
@@ -77,6 +81,7 @@ Repeat with the appropriate filename/content for other SD files.
 - PR #31: Bounded open-ended browser media ranges, merged.
 - PR #32: RAM-only throughput diagnostics, merged.
 - PR #33: Bounded streaming TCP send-window and AsyncTCP stack tuning, merged.
+- PR #34: AsyncTCP core-affinity experiment notes, merged; the code experiment was rejected.
 
 ## Performance Notes
 
@@ -89,6 +94,12 @@ Repeat with the appropriate filename/content for other SD files.
 - Tune media TCP capacity only after a request secures the primary stream slot. The RAM benchmark returns 409 during playback so rejected/diagnostic connections cannot allocate competing enlarged windows.
 - Direct AP testing was much slower despite a 72 Mbps reported link: median 1 MiB RAM and media rates were 86,842 B/s and 111,538 B/s. Home WiFi through the router should be preferred for Plex imports and large transfers; AP+STA shares one ESP32 radio.
 - The small RAM-versus-SD gap indicates that WiFi/TCP/AsyncWebServer is the primary throughput ceiling; avoid further SD buffering work without new evidence.
+- The unmerged dual-primary-stream experiment delivered two simultaneous 32 MiB
+  ranges at about 0.63 MB/s each, preserved independent seek integrity by SHA-256,
+  answered all diagnostic probes, and did not reboot. Single-stream median fell
+  from 1.28 MB/s to 0.92 MB/s. Current heap stayed above 28 KiB during the long
+  probe loop, but the transient minimum reached 6,344 bytes and recorded critical
+  low-water events. Do not merge until PC/phone playback confirms the tradeoff.
 
 ## Implementation Notes
 

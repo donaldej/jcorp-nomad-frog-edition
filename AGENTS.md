@@ -58,18 +58,19 @@ Repeat with the appropriate filename/content for other SD files.
 ## Current Device State
 
 - Last verified firmware upload succeeded through the authenticated OTA endpoint.
-- Last verified live firmware build ID: `Sep 29 2026 23:15:10`
-- Last verified build LED color: `#68566E`
+- Last verified live firmware build ID: `Sep 29 2026 23:26:38`
+- Last verified build LED color: `#A9B9FE`
 - The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
 - OTA validation completed on `app0`; the device remained responsive through repeated dual-stream tests.
 - The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
 - The live device uses the merged two-primary-stream configuration: each media
   connection uses the default 5,744-byte (4 MSS) TCP send target and AsyncTCP
   uses a 6 KiB task stack.
-- The live firmware is the validated `performance/coalesced-import-reindex`
-  candidate. Four zero-copy poster backfills generated eight logical index
-  requests; the worker reduced them to two paths and flushed one batch after the
-  queue drained. Minimum free heap remained above 47 KiB with no critical events.
+- The live firmware is the validated `performance/playback-priority-imports`
+  candidate. A queued Plex poster backfill remained in `waiting` while a throttled
+  movie stream was active, then resumed and completed after the 15-second playback
+  idle grace. The measured wait was 24 seconds; the menu stayed responsive, index
+  backlog returned to zero, OTA validation passed, and no critical heap event fired.
 
 ## Recent Feature PRs
 
@@ -107,6 +108,10 @@ Repeat with the appropriate filename/content for other SD files.
   eight requested paths became two unique index updates in one batch. A post-test
   4 MiB check measured median RAM throughput of 1,456,516 B/s and median SD-backed
   media throughput of 854,016 B/s.
+- Plex playback priority delays each new queued import while local media streaming
+  is active. It does not interrupt an import that has already started, avoiding
+  partial-transfer corruption and Plex HTTP timeout risk. Wait state and cumulative
+  wait timing are exposed in `/api/debug/status` under `plexImport`.
 
 ## Implementation Notes
 

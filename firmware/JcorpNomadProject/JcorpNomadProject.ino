@@ -388,6 +388,7 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define PLEX_QUEUE_PERSIST_INTERVAL_MS 5000UL
 #define PLEX_QUEUE_MAX_JOBS 16
 #define PLEX_REINDEX_IDLE_GRACE_MS 500
+#define PLEX_PLAYBACK_WAIT_POLL_MS 1000
 #define PLEX_ARTWORK_BUFFER_SIZE 16384
 #define PLEX_ARTWORK_MAX_BYTES (2UL * 1024UL * 1024UL)
 #define PLEX_SYNC_MANIFEST_PATH "/.system-index/plex_sync_manifest.ndjson"
@@ -618,6 +619,10 @@ static std::atomic<uint32_t> plexReindexFlushedCount{0};
 static std::atomic<uint32_t> plexReindexBatchCount{0};
 static std::atomic<uint32_t> plexReindexPendingCount{0};
 static std::atomic<uint32_t> plexReindexLastBatchPaths{0};
+static std::atomic<uint32_t> plexPlaybackWaitCount{0};
+static std::atomic<uint32_t> plexPlaybackWaitTotalMs{0};
+static std::atomic<uint32_t> plexPlaybackWaitLastMs{0};
+static std::atomic<bool> plexWaitingForPlayback{false};
 const char* PLEX_QUEUE_PATH = "/.system-index/plex_queue.ndjson";
 const char* PLEX_QUEUE_TEMP_PATH = "/.system-index/plex_queue.tmp";
 PlexImportJob* findPlexJobLocked(uint32_t id);
@@ -627,6 +632,7 @@ void updatePlexJob(PlexImportJob *job, const String &status, const String &messa
 bool persistPlexImportQueue();
 void loadPlexImportQueue();
 bool startPlexImportWorkerIfNeeded();
+bool waitForPlaybackBeforePlexImport(PlexImportJob *job);
 void plexImportTask(void *pvParameters);
 void plexPipelineWriterTask(void *pvParameters);
 bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
@@ -5475,6 +5481,29 @@ void flushPlexReindexPaths(std::vector<String> &pendingPaths) {
   plexReindexPendingCount.store(0, std::memory_order_relaxed);
 }
 
+bool waitForPlaybackBeforePlexImport(PlexImportJob *job) {
+  if (!job || !mediaStreamingActive) return true;
+  unsigned long startedMs = millis();
+  plexPlaybackWaitCount.fetch_add(1, std::memory_order_relaxed);
+  plexWaitingForPlayback.store(true, std::memory_order_relaxed);
+  webLogf("info", "[Plex] Waiting for playback before importing: %s",
+          job->label.c_str());
+  while (mediaStreamingActive && !job->cancelRequested) {
+    updatePlexJob(job, "waiting", "Waiting for playback to finish",
+                  job->downloaded, job->total, false);
+    vTaskDelay(pdMS_TO_TICKS(PLEX_PLAYBACK_WAIT_POLL_MS));
+  }
+  uint32_t waitedMs = millis() - startedMs;
+  plexWaitingForPlayback.store(false, std::memory_order_relaxed);
+  plexPlaybackWaitLastMs.store(waitedMs, std::memory_order_relaxed);
+  plexPlaybackWaitTotalMs.fetch_add(waitedMs, std::memory_order_relaxed);
+  if (!job->cancelRequested) {
+    webLogf("success", "[Plex] Playback idle after %u ms; import resuming",
+            (unsigned)waitedMs);
+  }
+  return !job->cancelRequested;
+}
+
 void plexImportTask(void *pvParameters) {
   (void)pvParameters;
   std::vector<String> deferredReindexPaths;
@@ -5527,6 +5556,13 @@ void plexImportTask(void *pvParameters) {
     }
     if (job->cancelRequested) {
       updatePlexJob(job, "cancelled", "Cancelled", job->downloaded, job->total, false);
+      persistPlexImportQueue();
+      continue;
+    }
+
+    if (!waitForPlaybackBeforePlexImport(job)) {
+      updatePlexJob(job, "cancelled", "Cancelled while waiting for playback",
+                    job->downloaded, job->total, false);
       persistPlexImportQueue();
       continue;
     }
@@ -8237,6 +8273,10 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   plex["reindexBatchCount"] = plexReindexBatchCount.load(std::memory_order_relaxed);
   plex["reindexPendingCount"] = plexReindexPendingCount.load(std::memory_order_relaxed);
   plex["reindexLastBatchPaths"] = plexReindexLastBatchPaths.load(std::memory_order_relaxed);
+  plex["waitingForPlayback"] = plexWaitingForPlayback.load(std::memory_order_relaxed);
+  plex["playbackWaitCount"] = plexPlaybackWaitCount.load(std::memory_order_relaxed);
+  plex["playbackWaitTotalMs"] = plexPlaybackWaitTotalMs.load(std::memory_order_relaxed);
+  plex["playbackWaitLastMs"] = plexPlaybackWaitLastMs.load(std::memory_order_relaxed);
 
   char syncMessage[96];
   portENTER_CRITICAL(&plexSyncStatusMux);

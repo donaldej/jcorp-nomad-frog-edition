@@ -58,16 +58,18 @@ Repeat with the appropriate filename/content for other SD files.
 ## Current Device State
 
 - Last verified firmware upload succeeded through the authenticated OTA endpoint.
-- Last verified live firmware build ID: `Sep  9 2026 23:14:54`
-- Last verified build LED color: `#4562C5`
+- Last verified live firmware build ID: `Sep 10 2026 01:28:57`
+- Last verified build LED color: `#CE4D83`
 - The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
 - OTA validation completed on `app0`; the device remained responsive through repeated dual-stream tests.
 - The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
-- The live device is running an unmerged two-primary-stream experiment from
-  `performance/two-primary-streams`: each media connection uses the default
-  5,744-byte (4 MSS) TCP send target and AsyncTCP uses a 6 KiB task stack.
-- Merged `main` remains on one primary stream, an 11,488-byte (8 MSS) media TCP
-  send target, and an 8 KiB AsyncTCP stack until real playback validates the experiment.
+- The live device uses the merged two-primary-stream configuration: each media
+  connection uses the default 5,744-byte (4 MSS) TCP send target and AsyncTCP
+  uses a 6 KiB task stack.
+- The live firmware is the validated `feature/plex-import-artwork` candidate.
+  A Plex poster backfill for the existing `300 (2007)` movie completed without
+  transferring media, saved a valid 120,363-byte JPEG, and refreshed the child
+  movie index. Minimum free heap remained above 50 KiB with no critical events.
 
 ## Recent Feature PRs
 
@@ -82,6 +84,8 @@ Repeat with the appropriate filename/content for other SD files.
 - PR #32: RAM-only throughput diagnostics, merged.
 - PR #33: Bounded streaming TCP send-window and AsyncTCP stack tuning, merged.
 - PR #34: AsyncTCP core-affinity experiment notes, merged; the code experiment was rejected.
+- PR #35: Two independent primary media streams with the validated 6 KiB AsyncTCP stack, merged.
+- PR #36: Movie index deduplication, open and intentionally separate from later features.
 
 ## Performance Notes
 
@@ -108,3 +112,19 @@ Repeat with the appropriate filename/content for other SD files.
 - Avoid storing generated Arduino build directories in git.
 - Changing `build_opt.h` invalidates the entire Arduino/ESP32 dependency cache and took about 23 minutes with `--jobs 1`; unchanged incremental builds returned to about 40 seconds.
 - Prefer `rg` for searches and keep edits narrowly scoped.
+
+## Planned Feature: ABS Support
+
+`ABS support` means an Audiobookshelf-compatible mode for the official
+Audiobookshelf app. The intended use case is to put audiobooks on the Nomad,
+point the app at the Nomad IP, sign in, browse the on-device library, and stream
+or resume books without another server.
+
+Start this later on its own `feature/audiobookshelf-compatibility` branch. The
+initial scope is one library rooted at `/Audiobooks`, a single local user,
+Audiobookshelf-compatible status/login/library/item/cover/playback/progress
+endpoints, stable path-derived item IDs, and direct-play MP3/M4A/M4B streaming
+through the existing byte-range media path. Support single- and multi-file
+books plus `cover.jpg`/`folder.jpg`. Do not include transcoding, podcasts, or the
+full Audiobookshelf administration API in the first version. Validate against
+the official mobile app over both `http://192.168.4.1` and home Wi-Fi.

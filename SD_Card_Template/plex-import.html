@@ -438,6 +438,13 @@
         .replace(/[. ]+$/g, '') || 'Untitled';
     }
 
+    function normalizePath(value) {
+      let path = String(value || '/').trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+      if (!path.startsWith('/')) path = `/${path}`;
+      if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+      return path;
+    }
+
     function extFromPart(part) {
       const file = part && part.file ? String(part.file) : '';
       const m = file.match(/\.([a-z0-9]{2,5})$/i);
@@ -467,15 +474,20 @@
         return {
           dir: `/Shows/${show}/Season ${String(season).padStart(2, '0')}`,
           filename: `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')} - ${title}${ext}`,
-          reindexRoot: '/Shows'
+          reindexRoot: '/Shows',
+          artworkKey: video.grandparentThumb || video.parentThumb || video.thumb || '',
+          artworkPath: `/Shows/${show}/poster.jpg`
         };
       }
       const title = cleanName(video.title);
       const year = video.year ? ` (${video.year})` : '';
+      const basename = `${title}${year}`;
       return {
-        dir: `/Movies/${title}${year}`,
-        filename: `${title}${year}${ext}`,
-        reindexRoot: '/Movies'
+        dir: `/Movies/${basename}`,
+        filename: `${basename}${ext}`,
+        reindexRoot: '/Movies',
+        artworkKey: video.thumb || '',
+        artworkPath: `/Movies/${basename}/${basename}.jpg`
       };
     }
 
@@ -521,7 +533,8 @@
       const mode = els.importMode.value === 'web'
         ? 'Plex will convert audio for browser playback.'
         : 'Original codecs may not play in every browser.';
-      els.selectedMessage.textContent = `Selected: ${item.title || item.grandparentTitle || 'Plex item'}${source ? ` - ${source}` : ''}. ${mode}`;
+      const artwork = target.artworkKey ? ' Plex artwork will also be imported.' : '';
+      els.selectedMessage.textContent = `Selected: ${item.title || item.grandparentTitle || 'Plex item'}${source ? ` - ${source}` : ''}. ${mode}${artwork}`;
       renderItems();
     }
 
@@ -687,14 +700,22 @@
       const part = selected && bestPart(selected);
       if (!part) return;
       const target = targetFor(selected);
+      const destDir = els.destDir.value.trim() || target.dir;
+      const filename = els.filename.value.trim() || target.filename;
+      const filenameBase = filename.replace(/\.[^/.]+$/, '');
+      const artworkPath = selected.type === 'episode'
+        ? target.artworkPath
+        : `${normalizePath(destDir)}/${filenameBase}.jpg`;
       const payload = {
         partKey: part.key,
         ratingKey: selected.ratingKey,
         importMode: els.importMode.value,
-        destDir: els.destDir.value.trim() || target.dir,
-        filename: els.filename.value.trim() || target.filename,
+        destDir,
+        filename,
         label: selected.title || selected.grandparentTitle || 'Plex item',
-        reindexRoot: target.reindexRoot
+        reindexRoot: target.reindexRoot,
+        artworkKey: target.artworkKey,
+        artworkPath: target.artworkKey ? artworkPath : ''
       };
       await api('/api/plex/import', {
         method: 'POST',
@@ -750,7 +771,10 @@
         const metrics = overall > 0
           ? ` - ${overall.toFixed(2)} MiB/s overall (network ${network.toFixed(2)}, SD ${sd.toFixed(2)})`
           : '';
-        row.querySelector('.queue-row-meta').textContent = `${job.message || ''}${job.destPath ? ` - ${job.destPath}` : ''}${total ? ` - ${percent}%` : ''}${metrics}`;
+        const artwork = job.artworkStatus && job.artworkStatus !== 'not-requested'
+          ? ` - Artwork: ${job.artworkMessage || job.artworkStatus}`
+          : '';
+        row.querySelector('.queue-row-meta').textContent = `${job.message || ''}${job.destPath ? ` - ${job.destPath}` : ''}${total ? ` - ${percent}%` : ''}${metrics}${artwork}`;
         const actions = row.querySelector('.queue-actions');
         if (['queued', 'waiting', 'running'].includes(job.status)) {
           const cancel = document.createElement('button');

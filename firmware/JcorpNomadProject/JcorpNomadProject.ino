@@ -644,6 +644,9 @@ bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
 bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
                        const std::shared_ptr<PsramResponseBuffer> &body,
                        const char *cacheControl);
+bool sendPsramEncodedResponse(AsyncWebServerRequest *request, const char *contentType,
+                              const std::shared_ptr<PsramResponseBuffer> &body,
+                              const char *cacheControl, const char *contentEncoding);
 const char* resetReasonName(esp_reset_reason_t reason);
 void initRestartDiagnostics();
 void updateRestartSnapshot(const char *operation);
@@ -672,6 +675,8 @@ static const uint32_t NOMAD_MEDIA_TCP_SEND_BUFFER_BYTES = 4UL * CONFIG_LWIP_TCP_
 static const uint32_t NOMAD_BENCHMARK_TCP_SEND_BUFFER_BYTES = 8UL * CONFIG_LWIP_TCP_MSS;
 static std::atomic<uint32_t> tcpSendBufferTunedCount{0};
 static std::atomic<uint32_t> tcpSendBufferTuneFailureCount{0};
+static std::atomic<uint32_t> gzipAssetResponseCount{0};
+static std::atomic<uint32_t> gzipAssetBytesServed{0};
 volatile uint32_t tcpSendBufferLastBeforeBytes = 0;
 volatile uint32_t tcpSendBufferLastAfterBytes = 0;
 volatile uint32_t healthLowHeapWarnCount = 0;
@@ -980,9 +985,9 @@ void printJsonEscapedTo(Print &out, const String &value) {
   }
 }
 
-bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
-                       const std::shared_ptr<PsramResponseBuffer> &body,
-                       const char *cacheControl) {
+bool sendPsramEncodedResponse(AsyncWebServerRequest *request, const char *contentType,
+                              const std::shared_ptr<PsramResponseBuffer> &body,
+                              const char *cacheControl, const char *contentEncoding) {
   if (!body || !body->data || body->overflow) return false;
   AwsResponseFiller filler = [body](uint8_t *destination, size_t maxLen, size_t index) -> size_t {
     if (index >= body->length) return 0;
@@ -993,8 +998,18 @@ bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
   AsyncWebServerResponse *response = request->beginResponse(contentType, body->length, filler);
   if (!response) return false;
   response->addHeader("Cache-Control", cacheControl);
+  if (contentEncoding) {
+    response->addHeader("Vary", "Accept-Encoding");
+    if (contentEncoding[0]) response->addHeader("Content-Encoding", contentEncoding);
+  }
   request->send(response);
   return true;
+}
+
+bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
+                       const std::shared_ptr<PsramResponseBuffer> &body,
+                       const char *cacheControl) {
+  return sendPsramEncodedResponse(request, contentType, body, cacheControl, nullptr);
 }
 
 bool sendPsramResponse(AsyncWebServerRequest *request, const char *contentType,
@@ -6482,7 +6497,24 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath,
     return true;
   }
 
-  File file = SD_MMC.open(filePath, FILE_READ);
+  if (!SD_MMC.exists(filePath)) {
+    if (sdMutex) xSemaphoreGive(sdMutex);
+    return false;
+  }
+
+  String sourcePath = filePath;
+  bool gzipEncoded = false;
+  if (!request->hasHeader("Range") && request->hasHeader("Accept-Encoding")) {
+    String accepted = request->header("Accept-Encoding");
+    accepted.toLowerCase();
+    String gzipPath = filePath + ".gz";
+    if (accepted.indexOf("gzip") >= 0 && SD_MMC.exists(gzipPath)) {
+      sourcePath = gzipPath;
+      gzipEncoded = true;
+    }
+  }
+
+  File file = SD_MMC.open(sourcePath, FILE_READ);
   if (!file || file.isDirectory()) {
     if (file) file.close();
     if (sdMutex) xSemaphoreGive(sdMutex);
@@ -6510,8 +6542,12 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath,
       const char *cacheControl = lower.endsWith(".html")
         ? "no-cache" : (isAuxiliaryAssetPath(lower)
           ? "public, max-age=86400" : "public, max-age=600");
-      if (!sendPsramResponse(request, mime.c_str(), body, cacheControl)) {
+      if (!sendPsramEncodedResponse(request, mime.c_str(), body, cacheControl,
+                                    gzipEncoded ? "gzip" : "")) {
         request->send(503, "text/plain", "Unable to serve UI asset");
+      } else if (gzipEncoded) {
+        gzipAssetResponseCount.fetch_add(1, std::memory_order_relaxed);
+        gzipAssetBytesServed.fetch_add(fileSize, std::memory_order_relaxed);
       }
       return true;
     }
@@ -6520,7 +6556,7 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath,
   // Large files retain the SD streaming path. UI pages and their normal assets
   // use PSRAM above so concurrent browser startup requests do not consume heap.
   file.close();
-  AsyncWebServerResponse *response = request->beginResponse(SD_MMC, filePath, mime);
+  AsyncWebServerResponse *response = request->beginResponse(SD_MMC, sourcePath, mime);
   if (sdMutex) xSemaphoreGive(sdMutex);
   if (!response) {
     request->send(503, "text/plain", "Unable to stream file");
@@ -6528,6 +6564,12 @@ bool sendBufferedSdFile(AsyncWebServerRequest *request, const String &filePath,
   }
   response->addHeader("Accept-Ranges", "bytes");
   response->addHeader("Cache-Control", "public, max-age=600");
+  response->addHeader("Vary", "Accept-Encoding");
+  if (gzipEncoded) {
+    response->addHeader("Content-Encoding", "gzip");
+    gzipAssetResponseCount.fetch_add(1, std::memory_order_relaxed);
+    gzipAssetBytesServed.fetch_add(fileSize, std::memory_order_relaxed);
+  }
   request->send(response);
   return true;
 }
@@ -7454,7 +7496,7 @@ server.on(
         return;
       }
 
-      String fullPath = dir + "/" + filename;
+      String fullPath = dir == "/" ? "/" + filename : dir + "/" + filename;
       if (!validateUserPath(fullPath, false, pathError)) {
         request->send(400, "application/json", String("{\"error\":\"") + jsonEscape(pathError) + "\"}");
         return;
@@ -8231,6 +8273,8 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
   http["benchmarkTcpSendBufferTargetBytes"] = NOMAD_BENCHMARK_TCP_SEND_BUFFER_BYTES;
   http["tcpSendBufferTunedCount"] = tcpSendBufferTunedCount.load(std::memory_order_relaxed);
   http["tcpSendBufferTuneFailureCount"] = tcpSendBufferTuneFailureCount.load(std::memory_order_relaxed);
+  http["gzipAssetResponseCount"] = gzipAssetResponseCount.load(std::memory_order_relaxed);
+  http["gzipAssetBytesServed"] = gzipAssetBytesServed.load(std::memory_order_relaxed);
   http["tcpSendBufferLastBeforeBytes"] = tcpSendBufferLastBeforeBytes;
   http["tcpSendBufferLastAfterBytes"] = tcpSendBufferLastAfterBytes;
   http["lastDebugPingAgeMs"] = httpLastDebugPingMs > 0 ? nowMs - httpLastDebugPingMs : 0;

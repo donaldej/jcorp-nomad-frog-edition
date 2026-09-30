@@ -58,19 +58,19 @@ Repeat with the appropriate filename/content for other SD files.
 ## Current Device State
 
 - Last verified firmware upload succeeded through the authenticated OTA endpoint.
-- Last verified live firmware build ID: `Sep 29 2026 23:26:38`
-- Last verified build LED color: `#A9B9FE`
+- Last verified live firmware build ID: `Sep 29 2026 23:49:45`
+- Last verified build LED color: `#568053`
 - The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
 - OTA validation completed on `app0`; the device remained responsive through repeated dual-stream tests.
 - The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
 - The live device uses the merged two-primary-stream configuration: each media
   connection uses the default 5,744-byte (4 MSS) TCP send target and AsyncTCP
   uses a 6 KiB task stack.
-- The live firmware is the validated `performance/playback-priority-imports`
-  candidate. A queued Plex poster backfill remained in `waiting` while a throttled
-  movie stream was active, then resumed and completed after the 15-second playback
-  idle grace. The measured wait was 24 seconds; the menu stayed responsive, index
-  backlog returned to zero, OTA validation passed, and no critical heap event fired.
+- The live firmware is the validated `performance/gzip-web-assets` candidate.
+  Twenty-nine root UI assets compress from 902,421 to 217,283 bytes. Live `/menu`,
+  `master.css`, and `admin.js` transfers fell from 71,543/75,711/56,691 bytes to
+  18,292/9,723/14,114 bytes. Ten compressed menu loads completed during active
+  playback with no low-memory or critical events; OTA validation passed.
 
 ## Recent Feature PRs
 
@@ -118,6 +118,9 @@ Repeat with the appropriate filename/content for other SD files.
 - Admin web files are served from the SD card template and usually need both firmware compile/upload and SD file upload when endpoints and UI change together.
 - Theme-aware pages use `theme-boot.js`, `theme-manager.js`, and the global `ThemeManager` symbol, not `window.ThemeManager`.
 - Avoid storing generated Arduino build directories in git.
+- Run `node tools/build-web-gzip.js` after changing a root-level HTML, CSS,
+  JavaScript, JSON, MJS, or SVG template. `tests/gzip-web-assets.test.js` verifies
+  every generated file expands byte-for-byte to its source.
 - Changing `build_opt.h` invalidates the entire Arduino/ESP32 dependency cache and took about 23 minutes with `--jobs 1`; unchanged incremental builds returned to about 40 seconds.
 - Prefer `rg` for searches and keep edits narrowly scoped.
 

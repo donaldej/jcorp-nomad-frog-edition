@@ -387,6 +387,7 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #define PLEX_QUEUE_PERSIST_INTERVAL_MS 5000UL
 #define PLEX_QUEUE_MAX_JOBS 16
+#define PLEX_REINDEX_IDLE_GRACE_MS 500
 #define PLEX_ARTWORK_BUFFER_SIZE 16384
 #define PLEX_ARTWORK_MAX_BYTES (2UL * 1024UL * 1024UL)
 #define PLEX_SYNC_MANIFEST_PATH "/.system-index/plex_sync_manifest.ndjson"
@@ -611,6 +612,12 @@ std::vector<PlexImportJob*> plexImportJobs;
 uint32_t plexImportNextId = 1;
 volatile bool plexImportWorkerRunning = false;
 SemaphoreHandle_t plexImportMutex = NULL;
+static std::atomic<uint32_t> plexReindexRequestedCount{0};
+static std::atomic<uint32_t> plexReindexCoalescedCount{0};
+static std::atomic<uint32_t> plexReindexFlushedCount{0};
+static std::atomic<uint32_t> plexReindexBatchCount{0};
+static std::atomic<uint32_t> plexReindexPendingCount{0};
+static std::atomic<uint32_t> plexReindexLastBatchPaths{0};
 const char* PLEX_QUEUE_PATH = "/.system-index/plex_queue.ndjson";
 const char* PLEX_QUEUE_TEMP_PATH = "/.system-index/plex_queue.tmp";
 PlexImportJob* findPlexJobLocked(uint32_t id);
@@ -5436,8 +5443,41 @@ bool downloadPlexArtwork(PlexImportJob *job, String &message) {
   return success;
 }
 
+bool deferPlexReindexPath(std::vector<String> &pendingPaths, const String &path) {
+  if (!path.length()) return false;
+  plexReindexRequestedCount.fetch_add(1, std::memory_order_relaxed);
+  String normalized = normalizePath(path);
+  for (const String &pending : pendingPaths) {
+    if (pending.equalsIgnoreCase(normalized)) {
+      plexReindexCoalescedCount.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+  }
+  pendingPaths.push_back(normalized);
+  plexReindexPendingCount.store((uint32_t)pendingPaths.size(),
+                                std::memory_order_relaxed);
+  return true;
+}
+
+void flushPlexReindexPaths(std::vector<String> &pendingPaths) {
+  uint32_t pathCount = (uint32_t)pendingPaths.size();
+  if (pathCount == 0) {
+    plexReindexPendingCount.store(0, std::memory_order_relaxed);
+    return;
+  }
+  plexReindexBatchCount.fetch_add(1, std::memory_order_relaxed);
+  plexReindexLastBatchPaths.store(pathCount, std::memory_order_relaxed);
+  webLogf("info", "[Plex] Flushing %u coalesced index update(s)",
+          (unsigned)pathCount);
+  for (const String &path : pendingPaths) enqueueIndexUpdateForPath(path);
+  plexReindexFlushedCount.fetch_add(pathCount, std::memory_order_relaxed);
+  pendingPaths.clear();
+  plexReindexPendingCount.store(0, std::memory_order_relaxed);
+}
+
 void plexImportTask(void *pvParameters) {
   (void)pvParameters;
+  std::vector<String> deferredReindexPaths;
   for (;;) {
     PlexImportJob *job = nullptr;
     bool locked = plexImportMutex &&
@@ -5451,13 +5491,32 @@ void plexImportTask(void *pvParameters) {
     if (locked) xSemaphoreGive(plexImportMutex);
 
     if (!job) {
+      vTaskDelay(pdMS_TO_TICKS(PLEX_REINDEX_IDLE_GRACE_MS));
+      bool idleLocked = plexImportMutex &&
+                        xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+      if (!idleLocked) continue;
+      bool queueRefilled = plexQueuedCountLocked() > 0;
+      xSemaphoreGive(plexImportMutex);
+      if (queueRefilled) continue;
+
+      flushPlexReindexPaths(deferredReindexPaths);
       if (bulkTransferActive) {
         bulkTransferActive = false;
         startBackgroundTasksIfNeeded();
         webLog("[Plex] Bulk transfer mode released", "success");
       }
-      plexImportWorkerRunning = false;
-      plexImportState.active = false;
+
+      bool exitLocked = plexImportMutex &&
+                        xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+      if (!exitLocked) continue;
+      bool queueArrivedDuringFlush = plexQueuedCountLocked() > 0;
+      if (!queueArrivedDuringFlush) {
+        plexImportWorkerRunning = false;
+        plexImportState.active = false;
+      }
+      xSemaphoreGive(plexImportMutex);
+      if (queueArrivedDuringFlush) continue;
+
       vTaskDeleteWithCaps(NULL);
       return;
     }
@@ -5667,10 +5726,10 @@ void plexImportTask(void *pvParameters) {
       if (job->artworkPath.length()) {
         String artworkDir = parentDirFromPath(job->artworkPath);
         if (artworkDir.length() && artworkDir != job->reindexRoot) {
-          enqueueIndexUpdateForPath(artworkDir);
+          deferPlexReindexPath(deferredReindexPaths, artworkDir);
         }
       }
-      if (job->reindexRoot.length()) enqueueIndexUpdateForPath(job->reindexRoot);
+      deferPlexReindexPath(deferredReindexPaths, job->reindexRoot);
     } else if (cancelled || job->cancelRequested) {
       updatePlexJob(job, "cancelled", "Cancelled; partial file retained", downloaded, total, false);
       webLogf("info", "[Plex] Import cancelled: %s", job->label.c_str());
@@ -8172,6 +8231,12 @@ server.on("/api/debug/status", HTTP_GET, [](AsyncWebServerRequest *request){
                        ? nowMs - importCopy.startedMs : 0;
   plex["averageBytesPerSec"] = importAverageBytesPerSec;
   plex["averageMiBPerSec"] = importAverageBytesPerSec / 1048576.0f;
+  plex["reindexRequestedCount"] = plexReindexRequestedCount.load(std::memory_order_relaxed);
+  plex["reindexCoalescedCount"] = plexReindexCoalescedCount.load(std::memory_order_relaxed);
+  plex["reindexFlushedCount"] = plexReindexFlushedCount.load(std::memory_order_relaxed);
+  plex["reindexBatchCount"] = plexReindexBatchCount.load(std::memory_order_relaxed);
+  plex["reindexPendingCount"] = plexReindexPendingCount.load(std::memory_order_relaxed);
+  plex["reindexLastBatchPaths"] = plexReindexLastBatchPaths.load(std::memory_order_relaxed);
 
   char syncMessage[96];
   portENTER_CRITICAL(&plexSyncStatusMux);

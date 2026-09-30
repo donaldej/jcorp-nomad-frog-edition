@@ -38,7 +38,7 @@ assert.match(firmware, /Media already present; artwork ready/,
 assert.match(firmware, /stream\.print\("\\\",\\\"status\\\":\\\""\)/,
   'queue status JSON should close importMode before serializing status');
 assert.match(firmware, /String artworkDir = parentDirFromPath\(job->artworkPath\)/);
-assert.match(firmware, /enqueueIndexUpdateForPath\(artworkDir\)/,
+assert.match(firmware, /deferPlexReindexPath\(deferredReindexPaths, artworkDir\)/,
   'the poster parent index should refresh so library pages discover the image');
 assert.match(firmware, /job->artworkKey = item\["thumb"\] \| ""/,
   'automatic Plex sync should retain movie artwork metadata');

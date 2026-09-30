@@ -58,18 +58,18 @@ Repeat with the appropriate filename/content for other SD files.
 ## Current Device State
 
 - Last verified firmware upload succeeded through the authenticated OTA endpoint.
-- Last verified live firmware build ID: `Sep 10 2026 01:28:57`
-- Last verified build LED color: `#CE4D83`
+- Last verified live firmware build ID: `Sep 29 2026 23:15:10`
+- Last verified build LED color: `#68566E`
 - The device was reachable at `192.168.18.65` on home WiFi with the AP still enabled.
 - OTA validation completed on `app0`; the device remained responsive through repeated dual-stream tests.
 - The RAM-only diagnostic endpoint was live at `/api/debug/throughput/ram`.
 - The live device uses the merged two-primary-stream configuration: each media
   connection uses the default 5,744-byte (4 MSS) TCP send target and AsyncTCP
   uses a 6 KiB task stack.
-- The live firmware is the validated `feature/plex-import-artwork` candidate.
-  A Plex poster backfill for the existing `300 (2007)` movie completed without
-  transferring media, saved a valid 120,363-byte JPEG, and refreshed the child
-  movie index. Minimum free heap remained above 50 KiB with no critical events.
+- The live firmware is the validated `performance/coalesced-import-reindex`
+  candidate. Four zero-copy poster backfills generated eight logical index
+  requests; the worker reduced them to two paths and flushed one batch after the
+  queue drained. Minimum free heap remained above 47 KiB with no critical events.
 
 ## Recent Feature PRs
 
@@ -85,7 +85,8 @@ Repeat with the appropriate filename/content for other SD files.
 - PR #33: Bounded streaming TCP send-window and AsyncTCP stack tuning, merged.
 - PR #34: AsyncTCP core-affinity experiment notes, merged; the code experiment was rejected.
 - PR #35: Two independent primary media streams with the validated 6 KiB AsyncTCP stack, merged.
-- PR #36: Movie index deduplication, open and intentionally separate from later features.
+- PR #36: Movie index deduplication, merged.
+- PR #37: Plex artwork import and existing-media poster backfill, merged.
 
 ## Performance Notes
 
@@ -98,12 +99,14 @@ Repeat with the appropriate filename/content for other SD files.
 - Tune media TCP capacity only after a request secures the primary stream slot. The RAM benchmark returns 409 during playback so rejected/diagnostic connections cannot allocate competing enlarged windows.
 - Direct AP testing was much slower despite a 72 Mbps reported link: median 1 MiB RAM and media rates were 86,842 B/s and 111,538 B/s. Home WiFi through the router should be preferred for Plex imports and large transfers; AP+STA shares one ESP32 radio.
 - The small RAM-versus-SD gap indicates that WiFi/TCP/AsyncWebServer is the primary throughput ceiling; avoid further SD buffering work without new evidence.
-- The unmerged dual-primary-stream experiment delivered two simultaneous 32 MiB
+- The merged dual-primary-stream configuration delivered two simultaneous 32 MiB
   ranges at about 0.63 MB/s each, preserved independent seek integrity by SHA-256,
-  answered all diagnostic probes, and did not reboot. Single-stream median fell
-  from 1.28 MB/s to 0.92 MB/s. Current heap stayed above 28 KiB during the long
-  probe loop, but the transient minimum reached 6,344 bytes and recorded critical
-  low-water events. Do not merge until PC/phone playback confirms the tradeoff.
+  answered all diagnostic probes, and did not reboot. Single-stream median is
+  approximately 0.92 MB/s, with results varying by Wi-Fi and SD-card conditions.
+- Queue-idle Plex reindex coalescing was validated with four completed jobs:
+  eight requested paths became two unique index updates in one batch. A post-test
+  4 MiB check measured median RAM throughput of 1,456,516 B/s and median SD-backed
+  media throughput of 854,016 B/s.
 
 ## Implementation Notes
 

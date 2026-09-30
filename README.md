@@ -96,7 +96,7 @@ If you just want to support the project, donations are always appreciated:
 - **AP + Home Wi-Fi:** Nomad keeps its offline access point available while optionally joining a configured home network, making large uploads and Plex access easier at home.
 - **Standalone Upload Manager:** The Uploads page provides multi-file selection, queue order, per-file progress, retry/cancel controls, and targeted library reindexing after uploads.
 - **Native Plex Import:** Configure a Plex server URL and token, browse movie and TV libraries, choose an import destination, and queue media without finding the source file manually. Plex posters are downloaded with successful imports and saved where the Movies and Shows pages discover them automatically.
-- **Persistent Plex Queue:** Device-side Plex imports are persisted and resumable. Imports continue after the browser tab closes, and queue state, progress, retry, cancel, and history are available when the page is reopened. A completed batch coalesces affected library indexes and rebuilds them once after the queue drains.
+- **Persistent Plex Queue:** Device-side Plex imports are persisted and resumable. Imports continue after the browser tab closes, and queue state, progress, retry, cancel, and history are available when the page is reopened. New transfers wait while local media playback is active, and a completed batch coalesces affected library indexes and rebuilds them once after the queue drains.
 - **Browser-Compatible Plex Media:** Plex imports can request H.264/AAC-compatible output for direct browser playback when source audio or container support would otherwise be a problem.
 - **Automatic Plex Sync:** Sync a Plex playlist or collection on a schedule, enforce a minimum free-space threshold, and optionally prune only files managed by that sync configuration.
 - **Bulk Transfer Mode:** Temporarily reduce nonessential background work during large Plex transfers to reserve memory and SD bandwidth for the import pipeline.
@@ -221,7 +221,9 @@ import a selected item directly to an SD-card destination.
 The on-device queue is persistent and resumable. Once an item is queued, the
 browser tab may be closed; Nomad continues the transfer and exposes its current
 status when the Plex Import page is opened again. Queue entries can be cancelled,
-retried, or removed from history.
+retried, or removed from history. To protect playback bandwidth, a queued item
+waits for active local streams to become idle before it starts transferring.
+An import that is already transferring is allowed to finish normally.
 
 Enable **Web Compatible** when the Plex source is not already suitable for direct
 browser playback. Plex will provide a compatible stream, including AAC audio when

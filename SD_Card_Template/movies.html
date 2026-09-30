@@ -446,14 +446,35 @@ async function buildFromIndexes(root){
   if(rootResp.header && rootResp.header.sig) rootSig = rootResp.header.sig;
 
   const map = new Map();
+  const seenEntryPaths = new Set();
+  const addIndexEntry = (entry, fallbackDir) => {
+    if(!entry || !entry.n) return;
+    const normalizedFallbackDir = normalizePath(fallbackDir);
+    const fallbackPath = normalizedFallbackDir === '/'
+      ? `/${entry.n}`
+      : `${normalizedFallbackDir}/${entry.n}`;
+    const full = normalizePath(entry.p || fallbackPath);
+    const pathKey = `${entry.t || 'f'}::${full.toLowerCase()}`;
+    if(seenEntryPaths.has(pathKey)) return;
+    seenEntryPaths.add(pathKey);
+
+    const slash = full.lastIndexOf('/');
+    const dir = slash > 0 ? full.slice(0, slash) : '/';
+    const base = entry.n.replace(/\.[^/.]+$/,'').toLowerCase();
+    const key = `${dir.toLowerCase()}::${base}`;
+    if(!map.has(key)) map.set(key, { dir, base, files: [] });
+    map.get(key).files.push({
+      name: entry.n,
+      t: entry.t,
+      sz: entry.sz || 0,
+      mt: entry.mt || 0,
+      full
+    });
+  };
+
   // gather root entries
   for(const e of rootResp.entries){
-    const dir = normalizePath(root);
-    const full = dir === '/' ? `/${e.n}` : `${dir}/${e.n}`;
-    const base = e.n.replace(/\.[^/.]+$/,'').toLowerCase();
-    const key = `${dir}::${base}`;
-    if(!map.has(key)) map.set(key, { dir, base, files: [] });
-    map.get(key).files.push({ name: e.n, t: e.t, sz: e.sz||0, mt: e.mt||0, full: normalizePath(full) });
+    addIndexEntry(e, root);
   }
 
   // fetch child dir indexes
@@ -463,12 +484,7 @@ async function buildFromIndexes(root){
       try {
         const resp = await fetchIndex(dirPath);
         for(const f of resp.entries){
-          const dir = normalizePath(dirPath);
-          const full = dir === '/' ? `/${f.n}` : `${dir}/${f.n}`;
-          const base = f.n.replace(/\.[^/.]+$/,'').toLowerCase();
-          const key = `${dir}::${base}`;
-          if(!map.has(key)) map.set(key, { dir, base, files: [] });
-          map.get(key).files.push({ name: f.n, t: f.t, sz: f.sz||0, mt: f.mt||0, full: normalizePath(full) });
+          addIndexEntry(f, dirPath);
         }
       } catch(err){
         console.warn('child index missing', dirPath, err);

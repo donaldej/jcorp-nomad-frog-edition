@@ -31,7 +31,9 @@ assert.match(movies, /await ensureNomadUtils\(\)[\s\S]{0,80}await ensurePlyrAsse
 
 assert.match(firmware, /size_t maxPsramBytes = 256UL \* 1024UL/,
   'normal UI assets should retain the existing 256 KiB PSRAM default');
-assert.match(firmware, /sendPsramResponse\(request, mime\.c_str\(\), body, cacheControl\)/);
+assert.match(firmware,
+  /sendPsramEncodedResponse\(request, mime\.c_str\(\), body, cacheControl,[\s\S]{0,80}gzipEncoded \? "gzip" : ""\)/,
+  'buffered UI assets should preserve PSRAM delivery and negotiate gzip');
 assert.match(firmware, /ESP\.getFreeHeap\(\) < HEALTH_LOW_HEAP_RESTART_BYTES/);
 assert.match(firmware, /busy->addHeader\("Retry-After", "1"\)/);
 assert.match(firmware, /url\.startsWith\("\/Movies\/"\)[\s\S]{0,100}handleRangeRequest\(request\)/);

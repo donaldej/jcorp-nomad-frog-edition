@@ -109,6 +109,7 @@ If you just want to support the project, donations are always appreciated:
 - **Bounded Browser Ranges:** Open-ended audio and video requests are served in 16 MiB segments, reducing long-lived response state while preserving explicit ranges, suffix ranges, and seeking.
 - **Two-Client Playback:** Up to two primary media requests can run concurrently with separate file handles and seek positions. A bounded overall response cap prevents additional SD-backed requests from exhausting internal memory.
 - **Memory-Bounded Streaming:** Each media connection uses the ESP32 network stack's four-MSS send capacity, while a measured 6 KiB AsyncTCP task stack returns internal RAM to the two-client workload. Runtime diagnostics expose the active TCP target, stream counts, heap low-water mark, and AsyncTCP stack headroom.
+- **Compressed Web Interface:** Browsers that support gzip receive precompressed HTML, CSS, and JavaScript while identity clients retain a compatible fallback. This cuts the normal interface payload by about 76% without runtime compression work on the ESP32.
 
 Two-client playback is intended for browser-compatible, moderate-bitrate media. On the development network, two simultaneous range transfers sustained approximately 0.63 MB/s per client and passed independent seek-integrity checks. A single stream sustained approximately 0.92 MB/s. Results vary with Wi-Fi conditions and media bitrate; use home Wi-Fi instead of the direct Nomad hotspot when concurrent playback matters.
 

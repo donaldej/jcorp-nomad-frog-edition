@@ -387,6 +387,8 @@ static bool shouldSkipIndexingPath(const String &path) {
 #define PLEX_IMPORT_STATUS_INTERVAL_MS 750
 #define PLEX_QUEUE_PERSIST_INTERVAL_MS 5000UL
 #define PLEX_QUEUE_MAX_JOBS 16
+#define PLEX_ARTWORK_BUFFER_SIZE 16384
+#define PLEX_ARTWORK_MAX_BYTES (2UL * 1024UL * 1024UL)
 #define PLEX_SYNC_MANIFEST_PATH "/.system-index/plex_sync_manifest.ndjson"
 #define PLEX_SYNC_MANIFEST_TEMP_PATH "/.system-index/plex_sync_manifest.tmp"
 #define HTTP_HEALTH_LOG_INTERVAL_MS 30000UL
@@ -479,6 +481,10 @@ struct PlexImportJob {
   String label;
   String reindexRoot;
   String destPath;
+  String artworkKey;
+  String artworkPath;
+  String artworkStatus = "not-requested";
+  String artworkMessage = "No artwork requested";
   String status = "queued";
   String message = "Queued";
   uint64_t downloaded = 0;
@@ -498,6 +504,10 @@ struct PlexImportJob {
 bool appendPlexSyncManifest(const PlexImportJob *job, uint64_t size);
 String plexQueryEncode(const String &value);
 String plexImportUrl(const PlexImportJob *job);
+String plexArtworkUrl(const PlexImportJob *job);
+void updatePlexArtworkStatus(PlexImportJob *job, const String &status,
+                             const String &message);
+bool downloadPlexArtwork(PlexImportJob *job, String &message);
 
 struct PlexTransferPipeline {
   File *out = nullptr;
@@ -4452,6 +4462,13 @@ String plexImportUrl(const PlexImportJob *job) {
   return plexUrlForPath(path);
 }
 
+String plexArtworkUrl(const PlexImportJob *job) {
+  if (!job || !job->artworkKey.length()) return "";
+  String path = "/photo/:/transcode?width=600&height=900&minSize=1&upscale=0&url=";
+  path += plexQueryEncode(job->artworkKey);
+  return plexUrlForPath(path);
+}
+
 void setPlexImportState(bool active, bool success, uint64_t downloaded, uint64_t total,
                         const String &label, const String &destPath, const String &message) {
   bool locked = (plexImportMutex && xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(200)) == pdTRUE);
@@ -4518,6 +4535,16 @@ void updatePlexJob(PlexImportJob *job, const String &status, const String &messa
   if (locked) xSemaphoreGive(plexImportMutex);
 }
 
+void updatePlexArtworkStatus(PlexImportJob *job, const String &status,
+                             const String &message) {
+  if (!job) return;
+  bool locked = plexImportMutex &&
+                xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
+  job->artworkStatus = status;
+  job->artworkMessage = message;
+  if (locked) xSemaphoreGive(plexImportMutex);
+}
+
 bool persistPlexImportQueue() {
   bool queueLocked = plexImportMutex &&
                      xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(500)) == pdTRUE;
@@ -4535,7 +4562,7 @@ bool persistPlexImportQueue() {
   if (ok) {
     for (PlexImportJob *job : plexImportJobs) {
       if (!job) continue;
-      StaticJsonDocument<1536> doc;
+      StaticJsonDocument<2048> doc;
       doc["id"] = job->id;
       doc["partKey"] = job->partKey;
       doc["ratingKey"] = job->ratingKey;
@@ -4545,6 +4572,10 @@ bool persistPlexImportQueue() {
       doc["label"] = job->label;
       doc["reindexRoot"] = job->reindexRoot;
       doc["destPath"] = job->destPath;
+      doc["artworkKey"] = job->artworkKey;
+      doc["artworkPath"] = job->artworkPath;
+      doc["artworkStatus"] = job->artworkStatus;
+      doc["artworkMessage"] = job->artworkMessage;
       doc["status"] = job->status;
       doc["message"] = job->message;
       doc["downloaded"] = job->downloaded;
@@ -4591,7 +4622,7 @@ void loadPlexImportQueue() {
     String line = in.readStringUntil('\n');
     line.trim();
     if (!line.length()) continue;
-    StaticJsonDocument<1536> doc;
+    StaticJsonDocument<2048> doc;
     if (deserializeJson(doc, line)) continue;
     PlexImportJob *job = new PlexImportJob();
     if (!job) break;
@@ -4606,6 +4637,10 @@ void loadPlexImportQueue() {
     job->reindexRoot = doc["reindexRoot"] | "";
     String defaultDestPath = job->destDir + "/" + job->filename;
     job->destPath = doc["destPath"] | defaultDestPath;
+    job->artworkKey = doc["artworkKey"] | "";
+    job->artworkPath = doc["artworkPath"] | "";
+    job->artworkStatus = doc["artworkStatus"] | (job->artworkKey.length() ? "pending" : "not-requested");
+    job->artworkMessage = doc["artworkMessage"] | (job->artworkKey.length() ? "Artwork queued" : "No artwork requested");
     job->status = doc["status"] | "queued";
     job->message = doc["message"] | "Queued";
     job->downloaded = doc["downloaded"] | 0ULL;
@@ -4926,6 +4961,15 @@ bool runPlexSyncOnce(bool allowDisabled = false) {
     job->reindexRoot = destDir.substring(0, destDir.indexOf('/', 1) > 0
                                         ? destDir.indexOf('/', 1) : destDir.length());
     job->destPath = destPath;
+    job->artworkKey = item["thumb"] | "";
+    if (job->artworkKey.length()) {
+      int extension = filename.lastIndexOf('.');
+      String artworkName = extension > 0 ? filename.substring(0, extension) + ".jpg"
+                                         : filename + ".jpg";
+      job->artworkPath = destDir + "/" + artworkName;
+      job->artworkStatus = "pending";
+      job->artworkMessage = "Artwork queued";
+    }
     job->managedSync = true;
     job->syncRatingKey = ratingKey;
     plexImportJobs.push_back(job);
@@ -5249,6 +5293,149 @@ bool runPlexTransferPipeline(PlexImportJob *job, WiFiClient *stream, File &out,
   return complete;
 }
 
+bool downloadPlexArtwork(PlexImportJob *job, String &message) {
+  if (!job || !job->artworkKey.length() || !job->artworkPath.length()) {
+    message = "No artwork requested";
+    return true;
+  }
+
+  bool sdReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+  if (!sdReady) {
+    message = "SD card busy before artwork download";
+    return false;
+  }
+  if (SD_MMC.exists(job->artworkPath)) {
+    if (sdMutex) xSemaphoreGive(sdMutex);
+    message = "Artwork already exists";
+    return true;
+  }
+
+  int slash = job->artworkPath.lastIndexOf('/');
+  String artworkDir = slash > 0 ? job->artworkPath.substring(0, slash) : "/";
+  if (!ensureDirectoryRecursive(artworkDir, message)) {
+    if (sdMutex) xSemaphoreGive(sdMutex);
+    return false;
+  }
+
+  String tempPath = job->artworkPath + ".part";
+  if (SD_MMC.exists(tempPath)) SD_MMC.remove(tempPath);
+  File out = SD_MMC.open(tempPath, FILE_WRITE);
+  if (sdMutex) xSemaphoreGive(sdMutex);
+  if (!out) {
+    message = "Failed to create artwork file";
+    return false;
+  }
+
+  uint8_t *buffer = static_cast<uint8_t*>(
+    heap_caps_malloc(PLEX_ARTWORK_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!buffer) {
+    out.close();
+    if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+      SD_MMC.remove(tempPath);
+      if (sdMutex) xSemaphoreGive(sdMutex);
+    }
+    message = "Not enough PSRAM for artwork";
+    return false;
+  }
+
+  WiFiClient client;
+  client.setNoDelay(true);
+  HTTPClient http;
+  http.setTimeout(15000);
+  const char* headers[] = { "Content-Length", "Content-Type" };
+  http.collectHeaders(headers, 2);
+  String url = plexArtworkUrl(job);
+  bool success = http.begin(client, url);
+  int code = success ? http.GET() : -1;
+  int contentLength = code == 200 ? http.getSize() : -1;
+  if (!success || code != 200) {
+    message = success ? "Plex artwork failed: HTTP " + String(code)
+                      : "Failed to open Plex artwork URL";
+    success = false;
+  } else if (!http.header("Content-Type").startsWith("image/")) {
+    message = "Plex artwork response was not an image";
+    success = false;
+  } else if (contentLength > (int)PLEX_ARTWORK_MAX_BYTES) {
+    message = "Plex artwork exceeds 2 MiB limit";
+    success = false;
+  }
+
+  uint64_t received = 0;
+  unsigned long lastDataMs = millis();
+  WiFiClient *stream = success ? http.getStreamPtr() : nullptr;
+  while (success && stream && (stream->connected() || stream->available())) {
+    if (job->cancelRequested) {
+      message = "Artwork download cancelled";
+      success = false;
+      break;
+    }
+    size_t available = stream->available();
+    if (!available) {
+      if (contentLength >= 0 && received >= (uint64_t)contentLength) break;
+      if (millis() - lastDataMs > 15000UL) {
+        message = "Plex artwork download timed out";
+        success = false;
+        break;
+      }
+      delay(1);
+      continue;
+    }
+
+    size_t toRead = min(available, (size_t)PLEX_ARTWORK_BUFFER_SIZE);
+    if (received + toRead > PLEX_ARTWORK_MAX_BYTES) {
+      message = "Plex artwork exceeds 2 MiB limit";
+      success = false;
+      break;
+    }
+    int bytesRead = stream->readBytes(buffer, toRead);
+    if (bytesRead <= 0) continue;
+    lastDataMs = millis();
+
+    bool writeReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+    if (!writeReady) {
+      message = "SD card busy during artwork write";
+      success = false;
+      break;
+    }
+    size_t written = out.write(buffer, (size_t)bytesRead);
+    if (sdMutex) xSemaphoreGive(sdMutex);
+    if (written != (size_t)bytesRead) {
+      message = "Artwork SD write failed";
+      success = false;
+      break;
+    }
+    received += written;
+    if (contentLength >= 0 && received >= (uint64_t)contentLength) break;
+  }
+  http.end();
+  heap_caps_free(buffer);
+
+  if (success && (received == 0 ||
+      (contentLength >= 0 && received != (uint64_t)contentLength))) {
+    message = received == 0 ? "Plex returned empty artwork"
+                            : "Plex artwork download ended early";
+    success = false;
+  }
+
+  bool finalizeReady = !sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE;
+  if (!finalizeReady) {
+    out.close();
+    message = "SD card busy while finalizing artwork";
+    return false;
+  }
+  out.flush();
+  out.close();
+  if (success) {
+    success = SD_MMC.rename(tempPath, job->artworkPath);
+    if (!success) message = "Failed to finalize artwork";
+  }
+  if (!success && SD_MMC.exists(tempPath)) SD_MMC.remove(tempPath);
+  if (sdMutex) xSemaphoreGive(sdMutex);
+
+  if (success) message = "Artwork saved";
+  return success;
+}
+
 void plexImportTask(void *pvParameters) {
   (void)pvParameters;
   for (;;) {
@@ -5310,6 +5497,7 @@ void plexImportTask(void *pvParameters) {
     String message;
     bool ok = false;
     bool cancelled = false;
+    bool mediaAlreadyExists = false;
     uint64_t downloaded = 0;
     uint64_t total = 0;
     job->transferElapsedMs = 0;
@@ -5331,7 +5519,18 @@ void plexImportTask(void *pvParameters) {
       } else if (!ensureDirectoryRecursive(job->destDir, message)) {
         if (sdMutex) xSemaphoreGive(sdMutex);
       } else if (SD_MMC.exists(job->destPath)) {
-        message = "Destination already exists";
+        if (job->artworkKey.length() && job->artworkPath.length()) {
+          File existing = SD_MMC.open(job->destPath, FILE_READ);
+          if (existing) {
+            downloaded = existing.size();
+            total = downloaded;
+            existing.close();
+          }
+          mediaAlreadyExists = true;
+          ok = true;
+        } else {
+          message = "Destination already exists";
+        }
         if (sdMutex) xSemaphoreGive(sdMutex);
       } else {
         if (sdMutex) xSemaphoreGive(sdMutex);
@@ -5440,10 +5639,36 @@ void plexImportTask(void *pvParameters) {
     }
 
     if (ok) {
-      updatePlexJob(job, "done", "Complete", downloaded, total ? total : downloaded, true);
+      String completionMessage = mediaAlreadyExists
+        ? "Media already present; artwork ready"
+        : "Complete";
+      if (job->artworkKey.length() && job->artworkPath.length()) {
+        updatePlexArtworkStatus(job, "downloading", "Downloading artwork");
+        updatePlexJob(job, "running", "Downloading artwork", downloaded,
+                      total ? total : downloaded, false);
+        String artworkMessage;
+        bool artworkOk = downloadPlexArtwork(job, artworkMessage);
+        updatePlexArtworkStatus(job, artworkOk ? "done" : "failed", artworkMessage);
+        if (artworkOk) {
+          webLogf("success", "[Plex] Artwork ready: %s", job->artworkPath.c_str());
+        } else {
+          completionMessage = mediaAlreadyExists
+            ? "Media already present; artwork unavailable"
+            : "Complete; artwork unavailable";
+          webLogf("warning", "[Plex] Artwork failed: %s", artworkMessage.c_str());
+        }
+      }
+      updatePlexJob(job, "done", completionMessage, downloaded,
+                    total ? total : downloaded, true);
       webLogf("success", "[Plex] Import complete: %s", job->destPath.c_str());
       if (job->managedSync && !appendPlexSyncManifest(job, downloaded)) {
         webLog("[Plex Sync] Import completed but manifest update failed", "error");
+      }
+      if (job->artworkPath.length()) {
+        String artworkDir = parentDirFromPath(job->artworkPath);
+        if (artworkDir.length() && artworkDir != job->reindexRoot) {
+          enqueueIndexUpdateForPath(artworkDir);
+        }
       }
       if (job->reindexRoot.length()) enqueueIndexUpdateForPath(job->reindexRoot);
     } else if (cancelled || job->cancelRequested) {
@@ -7601,7 +7826,7 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
     stream.printf("{\"id\":%u", (unsigned)job->id);
     stream.print(",\"importMode\":\"");
     printJsonEscapedTo(stream, job->importMode);
-    stream.print(",\"status\":\"");
+    stream.print("\",\"status\":\"");
     printJsonEscapedTo(stream, job->status);
     stream.print("\",\"success\":");
     stream.print(job->success ? "true" : "false");
@@ -7626,6 +7851,12 @@ server.on("/api/plex/import-status", HTTP_GET, [](AsyncWebServerRequest *request
     printJsonEscapedTo(stream, job->label);
     stream.print("\",\"destPath\":\"");
     printJsonEscapedTo(stream, job->destPath);
+    stream.print("\",\"artworkPath\":\"");
+    printJsonEscapedTo(stream, job->artworkPath);
+    stream.print("\",\"artworkStatus\":\"");
+    printJsonEscapedTo(stream, job->artworkStatus);
+    stream.print("\",\"artworkMessage\":\"");
+    printJsonEscapedTo(stream, job->artworkMessage);
     stream.print("\",\"message\":\"");
     printJsonEscapedTo(stream, job->message);
     stream.print("\"}");
@@ -7981,7 +8212,7 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
     return;
   }
 
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1536> doc;
   DeserializationError error = deserializeJson(doc, request->getParam("body", true)->value());
   if (error) {
     request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
@@ -7995,6 +8226,8 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
   String filename = doc["filename"] | "";
   String label = doc["label"] | filename;
   String reindexRoot = doc["reindexRoot"] | "";
+  String artworkKey = doc["artworkKey"] | "";
+  String artworkPath = doc["artworkPath"] | "";
   String pathError;
 
   if (!partKey.startsWith("/")) {
@@ -8022,6 +8255,30 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
     request->send(400, "application/json", String("{\"error\":\"") + jsonEscape(pathError) + "\"}");
     return;
   }
+  if ((artworkKey.length() == 0) != (artworkPath.length() == 0)) {
+    request->send(400, "application/json", "{\"error\":\"Artwork key and path must be provided together\"}");
+    return;
+  }
+  if (artworkKey.length()) {
+    String lowerArtworkPath = artworkPath;
+    lowerArtworkPath.toLowerCase();
+    if (!artworkKey.startsWith("/") ||
+        (!lowerArtworkPath.endsWith(".jpg") && !lowerArtworkPath.endsWith(".jpeg"))) {
+      request->send(400, "application/json", "{\"error\":\"Invalid Plex artwork destination\"}");
+      return;
+    }
+    if (!validateUserPath(artworkPath, false, pathError)) {
+      request->send(400, "application/json", String("{\"error\":\"") + jsonEscape(pathError) + "\"}");
+      return;
+    }
+    String normalizedArtwork = normalizePath(artworkPath);
+    String normalizedRoot = normalizePath(reindexRoot);
+    if (reindexRoot.length() && normalizedArtwork != normalizedRoot &&
+        !normalizedArtwork.startsWith(normalizedRoot + "/")) {
+      request->send(400, "application/json", "{\"error\":\"Artwork must stay inside the indexed library\"}");
+      return;
+    }
+  }
 
   PlexImportJob *job = new PlexImportJob();
   if (!job) {
@@ -8036,6 +8293,12 @@ server.on("/api/plex/import", HTTP_POST, [](AsyncWebServerRequest *request){
   job->label = label;
   job->reindexRoot = reindexRoot;
   job->destPath = destPath;
+  job->artworkKey = artworkKey;
+  job->artworkPath = artworkPath;
+  if (artworkKey.length()) {
+    job->artworkStatus = "pending";
+    job->artworkMessage = "Artwork queued";
+  }
 
   bool locked = plexImportMutex &&
                 xSemaphoreTake(plexImportMutex, pdMS_TO_TICKS(250)) == pdTRUE;
@@ -8104,6 +8367,10 @@ server.on("/api/plex/import-action", HTTP_POST, [](AsyncWebServerRequest *reques
       job->status = "queued";
       job->message = "Queued to resume";
       job->success = false;
+      if (job->artworkKey.length()) {
+        job->artworkStatus = "pending";
+        job->artworkMessage = "Artwork queued";
+      }
       changed = true;
     }
   }
